@@ -5,3 +5,5 @@ xcuserdata/
 .swiftpm
 .build/
 Carthage/Build/
+*.xcframework
+*.xcframework.zip
