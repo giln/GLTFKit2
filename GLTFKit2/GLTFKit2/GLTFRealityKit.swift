@@ -1509,6 +1509,8 @@ public class GLTFRealityKitLoader {
         let delay = TimeInterval(sampleTimes.first ?? 0.0)
 
         if info.setInfos.isEmpty {
+            // No individual weight sets were registered, so drive the aggregate
+            // blend-shape weight binding with the reordered frames we built.
             let animation = SampledAnimation(weightNames: info.weightNames,
                                              frames: frames,
                                              tweenMode: tweenMode,
@@ -1521,6 +1523,9 @@ public class GLTFRealityKitLoader {
             var animations = [AnimationDefinition]()
             for (id, names) in info.setInfos {
                 guard let setFrames = framesBySet[id], !setFrames.isEmpty else { continue }
+                // RealityKit inserts a weight set for each mesh part, so address
+                // the matching binding using the cached identifier and replay the
+                // per-set frames.
                 let animation = SampledAnimation(weightNames: names,
                                                  frames: setFrames,
                                                  tweenMode: tweenMode,
