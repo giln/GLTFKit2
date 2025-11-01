@@ -103,30 +103,27 @@ func packedFloat2Array(for accessor: GLTFAccessor, flipVertically: Bool = false)
 }
 
 func packedFloat3Array(for accessor: GLTFAccessor) -> [SIMD3<Float>]? {
-    if (accessor.dimension != .vector3 && accessor.dimension != .vector4) {
-        return nil
-    }
-    if accessor.componentType != .float {
-        print("[GLTFKit2] Unsupported component type for conversion to packed float3 array: \(accessor.componentType). Please file an issue if you see this message.")
+    if accessor.dimension != .vector3 && accessor.dimension != .vector4 {
         return nil
     }
 
-    guard let bufferView = accessor.bufferView else { return nil }
-    guard let bufferData = bufferView.buffer.data else { return nil }
+    let componentCount = (accessor.dimension == .vector4) ? 4 : 3
+    let vectorCount = accessor.count
 
-    let vertexCount = accessor.count
-    let offset = bufferView.offset + accessor.offset
-    let elementStride = (bufferView.stride != 0) ? bufferView.stride : packedStride(for: accessor)
-    let vectors = [SIMD3<Float>](unsafeUninitializedCapacity: vertexCount) { buffer, initializedCount in
-        bufferData.withUnsafeBytes { rawPtr in
-            guard let basePtr = rawPtr.baseAddress?.advanced(by: offset) else { initializedCount = 0; return }
-            for v in 0..<vertexCount {
-                let elementPtr = basePtr.advanced(by: elementStride * v).bindMemory(to: Float.self, capacity: 3)
-                buffer[v] = SIMD3(elementPtr[0], elementPtr[1], elementPtr[2])
-            }
-            initializedCount = vertexCount
+    let packedData = GLTFPackedDataForAccessor(accessor) as Data
+    let floatData = GLTFTransformPackedDataToFloat(packedData, accessor) as Data
+
+    var vectors = [SIMD3<Float>]()
+    vectors.reserveCapacity(vectorCount)
+
+    floatData.withUnsafeBytes { rawBuffer in
+        guard let floatPtr = rawBuffer.bindMemory(to: Float.self).baseAddress else { return }
+        for index in 0..<vectorCount {
+            let base = floatPtr.advanced(by: index * componentCount)
+            vectors.append(SIMD3(base[0], base[1], base[2]))
         }
     }
+
     return vectors
 }
 
@@ -355,6 +352,14 @@ fileprivate class UniqueNameGenerator {
     }
 }
 
+#if compiler(>=6.0) || os(visionOS)
+@available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+fileprivate struct BlendShapeInfo {
+    var weightNames: [String]
+    var setInfos: [BlendShapeWeightsData.ID: [String]] = [:]
+}
+#endif
+
 @available(macOS 12.0, iOS 15.0, *)
 class GLTFRealityKitResourceContext {
     enum ColorMask : Int {
@@ -577,7 +582,24 @@ public class GLTFRealityKitLoader {
     private var jointNamesBySkeletonID: [String: [String]] = [:]
     private var restPoseTransformsBySkeletonID: [String: [Transform]] = [:]
     private var ancestorChainsBySkeletonID: [String: [String: [GLTFNode]]] = [:]
-    #endif
+    private var blendShapeInfoStorage = [ObjectIdentifier: Any]()
+#endif
+
+#if compiler(>=6.0) || os(visionOS)
+    @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+    private func blendShapeInfo(for identifier: ObjectIdentifier) -> BlendShapeInfo? {
+        return blendShapeInfoStorage[identifier] as? BlendShapeInfo
+    }
+
+    @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+    private func setBlendShapeInfo(_ info: BlendShapeInfo?, for identifier: ObjectIdentifier) {
+        if let info {
+            blendShapeInfoStorage[identifier] = info
+        } else {
+            blendShapeInfoStorage.removeValue(forKey: identifier)
+        }
+    }
+#endif
 
     public static func load(from url: URL) async throws -> RealityKit.Entity {
         let asset = try GLTFAsset(url: url)
@@ -665,6 +687,53 @@ public class GLTFRealityKitLoader {
         if let gltfMesh = gltfNode.mesh,
            let meshComponent = try convert(mesh: gltfMesh, skeleton: skeleton, context: context) {
             nodeEntity.components.set(meshComponent)
+
+            #if compiler(>=6.0) || os(visionOS)
+            if #available(macOS 15.0, iOS 18.0, visionOS 2.0, *) {
+                let meshIdentifier = ObjectIdentifier(gltfMesh)
+                if var blendShapeInfo = blendShapeInfo(for: meshIdentifier),
+                   !blendShapeInfo.weightNames.isEmpty {
+                    var blendShapeComponent = BlendShapeWeightsComponent(weightsMapping: BlendShapeWeightsMapping(meshResource: meshComponent.mesh))
+                    var weightSet = blendShapeComponent.weightSet
+                    if !weightSet.isEmpty {
+                        print("[GLTFKit2][Debug] Blend shape weight set count for \(gltfMesh.name ?? "<unnamed>"):", weightSet.count)
+
+                        let defaultWeights = defaultBlendShapeWeights(for: gltfNode)
+                        var weightsByName = [String: Float]()
+                        for (index, name) in blendShapeInfo.weightNames.enumerated() {
+                            if index < defaultWeights.count {
+                                weightsByName[name] = defaultWeights[index]
+                            } else {
+                                weightsByName[name] = 0.0
+                            }
+                        }
+
+                        var setInfos = [BlendShapeWeightsData.ID: [String]]()
+                        for data in weightSet {
+                            let names = data.weightNames
+                            print("[GLTFKit2][Debug] Weight set \(data.id) names: \(names)")
+                            let values = names.map { weightsByName[$0] ?? 0.0 }
+                            var updated = data
+                            updated.weights = BlendShapeWeights(values)
+                            weightSet.set(updated)
+                            setInfos[updated.id] = names
+                        }
+
+                        if var defaultEntry = weightSet.default {
+                            let defaultValues = defaultEntry.weightNames.map { weightsByName[$0] ?? 0.0 }
+                            defaultEntry.weights = BlendShapeWeights(defaultValues)
+                            weightSet.default = defaultEntry
+                        }
+
+                        blendShapeComponent.weightSet = weightSet
+                        nodeEntity.components.set(blendShapeComponent)
+
+                        blendShapeInfo.setInfos = setInfos
+                        setBlendShapeInfo(blendShapeInfo, for: meshIdentifier)
+                    }
+                }
+            }
+            #endif
         }
 
         if #available(visionOS 2.0, *) {
@@ -692,6 +761,19 @@ public class GLTFRealityKitLoader {
 
         return nodeEntity
     }
+
+#if compiler(>=6.0) || os(visionOS)
+    @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+    private func defaultBlendShapeWeights(for node: GLTFNode) -> [Float] {
+        if let nodeWeights = node.weights {
+            return nodeWeights.map { Float(truncating: $0) }
+        }
+        if let meshWeights = node.mesh?.weights {
+            return meshWeights.map { Float(truncating: $0) }
+        }
+        return []
+    }
+#endif
 
     #if compiler(>=6.0) || os(visionOS)
     @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
@@ -838,28 +920,72 @@ public class GLTFRealityKitLoader {
         }
         #endif
 
-        typealias PartMaterialPair = (MeshResource.Part, any RealityKit.Material)
-        var primitiveMaterialIndex: Int = 0
-        let partsAndMaterials = try gltfMesh.primitives.compactMap { primitive -> PartMaterialPair? in
-            if let part = self.convert(primitive: primitive, materialIndex: primitiveMaterialIndex, 
-                                       skeletonID: skeletonID, context:context)
-            {
-                let material = try self.convert(material: primitive.material, context: context)
-                primitiveMaterialIndex += 1
-                return (part, material)
+        var blendShapeNames: [String] = []
+        #if compiler(>=6.0) || os(visionOS)
+        if #available(macOS 15.0, iOS 18.0, *),
+           let maxTargetCount = gltfMesh.primitives.map({ $0.targets.count }).max(),
+           maxTargetCount > 0
+        {
+            let providedNames = gltfMesh.targetNames ?? []
+            var usedNames = Set<String>()
+            blendShapeNames = (0..<maxTargetCount).map { index -> String in
+                let baseName: String
+                if index < providedNames.count {
+                    let trimmed = providedNames[index].trimmingCharacters(in: .whitespacesAndNewlines)
+                    baseName = trimmed.isEmpty ? "BlendShape\(index)" : trimmed
+                } else {
+                    baseName = "BlendShape\(index)"
+                }
+                var candidate = baseName
+                var suffix = 1
+                while usedNames.contains(candidate) {
+                    candidate = "\(baseName)_\(suffix)"
+                    suffix += 1
+                }
+                usedNames.insert(candidate)
+                return candidate
             }
-            // If we fail to create a part from a primitive, omit it from the list.
-            return nil
+        }
+        #endif
+
+        typealias PrimitiveConversion = (part: MeshResource.Part, material: any RealityKit.Material, hasBlendShapes: Bool)
+        var primitiveMaterialIndex: Int = 0
+        let primitiveConversions = try gltfMesh.primitives.compactMap { primitive -> PrimitiveConversion? in
+            guard let (part, hasBlendShapes) = self.convert(primitive: primitive,
+                                                            materialIndex: primitiveMaterialIndex,
+                                                            skeletonID: skeletonID,
+                                                            blendShapeNames: blendShapeNames,
+                                                            context: context) else {
+                return nil
+            }
+
+            let material = try self.convert(material: primitive.material, context: context)
+            primitiveMaterialIndex += 1
+            return (part, material, hasBlendShapes)
         }
 
-        if partsAndMaterials.count == 0 {
+        if primitiveConversions.isEmpty {
             // If we weren't able to successfully build any parts for our primitives, don't bother generating a mesh.
             return nil
         }
 
-        let parts = partsAndMaterials.map { $0.0 }
-        let materials = partsAndMaterials.map { $0.1 }
-        
+        let parts = primitiveConversions.map { $0.part }
+        let materials = primitiveConversions.map { $0.material }
+        #if compiler(>=6.0) || os(visionOS)
+        let meshIdentifier = ObjectIdentifier(gltfMesh)
+        if #available(macOS 15.0, iOS 18.0, *), !blendShapeNames.isEmpty {
+            if primitiveConversions.contains(where: { $0.hasBlendShapes }) {
+                var info = blendShapeInfo(for: meshIdentifier) ?? BlendShapeInfo(weightNames: blendShapeNames)
+                info.weightNames = blendShapeNames
+                setBlendShapeInfo(info, for: meshIdentifier)
+            } else {
+                setBlendShapeInfo(nil, for: meshIdentifier)
+            }
+        } else {
+            blendShapeInfoStorage.removeValue(forKey: meshIdentifier)
+        }
+        #endif
+
         // TODO: This only ensures uniqueness for unnamed meshes; the asset could still contain duplicate names.
         let modelName = gltfMesh.name ?? nameGenerator.nextUniqueName(prefix: "Mesh")
         let model = MeshResource.Model(id: modelName, parts: parts)
@@ -881,7 +1007,8 @@ public class GLTFRealityKitLoader {
     }
 
     func convert(primitive gltfPrimitive: GLTFPrimitive, materialIndex: Int = 0, skeletonID: String? = nil,
-                 context: GLTFRealityKitResourceContext) -> RealityKit.MeshResource.Part?
+                 blendShapeNames: [String] = [],
+                 context: GLTFRealityKitResourceContext) -> (MeshResource.Part, Bool)?
     {
         if gltfPrimitive.primitiveType != .triangles {
             return nil
@@ -889,11 +1016,15 @@ public class GLTFRealityKitLoader {
 
         let partName = nameGenerator.nextUniqueName(prefix: "Primitive")
         var part = MeshResource.Part(id: partName, materialIndex: materialIndex)
+        var vertexCount = 0
 
         if let positionAttribute = gltfPrimitive.attribute(forName: "POSITION"),
            let positionArray = packedFloat3Array(for: positionAttribute.accessor)
         {
             part[MeshBuffers.positions] = MeshBuffers.Positions(positionArray)
+            vertexCount = positionArray.count
+        } else if let positionAttribute = gltfPrimitive.attribute(forName: "POSITION") {
+            vertexCount = positionAttribute.accessor.count
         }
 
         if let normalAttribute = gltfPrimitive.attribute(forName: "NORMAL"),
@@ -913,6 +1044,40 @@ public class GLTFRealityKitLoader {
         {
             part[MeshBuffers.textureCoordinates] = MeshBuffers.TextureCoordinates(texCoordsArray)
         }
+
+        var emittedBlendShapeOffsets = false
+
+        #if compiler(>=6.0) || os(visionOS)
+        if #available(macOS 15.0, iOS 18.0, *),
+           !blendShapeNames.isEmpty,
+           !gltfPrimitive.targets.isEmpty,
+           vertexCount > 0
+        {
+            print("[GLTFKit2][Debug] Processing primitive \(partName) with \(gltfPrimitive.targets.count) morph targets (vertexCount=\(vertexCount))")
+            for (targetIndex, targetAttributes) in gltfPrimitive.targets.enumerated() {
+                guard targetIndex < blendShapeNames.count else { break }
+
+                guard let positionAttribute = targetAttributes.first(where: { $0.name == "POSITION" }) else {
+                    print("[GLTFKit2][Debug] Skipping target #\(targetIndex) for \(partName); POSITION attribute not found (available: \(targetAttributes.map { $0.name ?? "<nil>" }))")
+                    continue
+                }
+
+                guard let offsets = packedFloat3Array(for: positionAttribute.accessor) else {
+                    print("[GLTFKit2][Debug] Skipping target #\(targetIndex) for \(partName); unable to read POSITION accessor")
+                    continue
+                }
+
+                guard offsets.count == vertexCount else {
+                    print("[GLTFKit2][Debug] Skipping target #\(targetIndex) for \(partName); vertex count mismatch offsets=\(offsets.count) expected=\(vertexCount)")
+                    continue
+                }
+
+                part[MeshBuffers.blendShapeOffsets(named: blendShapeNames[targetIndex])] = MeshBuffers.BlendShapeOffsets(offsets)
+                emittedBlendShapeOffsets = true
+                print("[GLTFKit2][Debug] Added blend shape offsets for target \(blendShapeNames[targetIndex]) with \(offsets.count) vertices")
+            }
+        }
+        #endif
 
         #if compiler(>=6.0) || os(visionOS)
         if #available(macOS 15.0, iOS 18.0, *) {
@@ -971,7 +1136,7 @@ public class GLTFRealityKitLoader {
             part.triangleIndices = MeshBuffers.TriangleIndices(indices)
         }
 
-        return part
+        return (part, emittedBlendShapeOffsets)
     }
 
     @MainActor func convert(material gltfMaterial: GLTFMaterial?,
@@ -1116,15 +1281,27 @@ public class GLTFRealityKitLoader {
         var transformSamplersByNodeID = [ObjectIdentifier: GLTFTransformSampler]()
         var animations = [AnimationDefinition]()
         for (_, channels) in groupedChannels {
-            if let _ = channels.first(where: { $0.target.path == GLTFAnimationPath.weights.rawValue }), channels.count == 1 {
-                continue // TODO: Implement morph target animation
-            }
             guard let targetNode = channels.first?.target.node else {
                 continue // Can't create an animation without at least one channel and a target
             }
+
+            #if compiler(>=6.0) || os(visionOS)
+            if #available(macOS 15.0, iOS 18.0, visionOS 2.0, *),
+               let mesh = targetNode.mesh
+            {
+                animations.append(contentsOf: convertWeightAnimations(for: targetNode,
+                                                                      mesh: mesh,
+                                                                      channels: channels))
+            }
+            #endif
+
             let translationChannel = channels.first { $0.target.path == GLTFAnimationPath.translation.rawValue }
             let rotationChannel = channels.first { $0.target.path == GLTFAnimationPath.rotation.rawValue }
             let scaleChannel = channels.first { $0.target.path == GLTFAnimationPath.scale.rawValue }
+            let hasTransformChannel = translationChannel != nil || rotationChannel != nil || scaleChannel != nil
+            if !hasTransformChannel {
+                continue
+            }
             let transformSampler = GLTFTransformSampler(target: targetNode,
                                                         translationChannel: translationChannel,
                                                         rotationChannel: rotationChannel,
@@ -1148,6 +1325,7 @@ public class GLTFRealityKitLoader {
                                                         tweenMode: transformSampler.hasStepChannel ? .hold : .linear,
                                                         frameInterval: transformSampler.recommendedSampleInterval,
                                                         bindTarget: targetNode.bindPath.transform,
+                                                        repeatMode: .repeat,
                                                         delay: TimeInterval(transformSampler.startTime))
                 animations.append(sampledAnimation)
             }
@@ -1224,6 +1402,7 @@ public class GLTFRealityKitLoader {
                                                          tweenMode: .linear, // TODO: Support .hold?
                                                          frameInterval: jointAnimation.sampleInterval,
                                                          bindTarget: bindPath.jointTransforms,
+                                                         repeatMode: .repeat,
                                                          delay: delay)
                 animations.append(skeletalAnimation)
             }
@@ -1232,6 +1411,156 @@ public class GLTFRealityKitLoader {
         let groupAnimation = AnimationGroup(group: animations, name: name)
         return try AnimationResource.generate(with: groupAnimation)
     }
+
+#if compiler(>=6.0) || os(visionOS)
+    @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+    private func convert(weightChannel: GLTFAnimationChannel,
+                         info: BlendShapeInfo,
+                         defaultWeights: [Float],
+                         entityPath: BindTarget.EntityPath) -> [AnimationDefinition]
+    {
+        let sampler = weightChannel.sampler
+
+        guard !info.weightNames.isEmpty,
+              let sampleTimes = packedFloatArray(for: sampler.input),
+              let weightValues = packedFloatArray(for: sampler.output) else {
+            return []
+        }
+
+        print("[GLTFKit2][Debug] Weight channel sample times for \(weightChannel.target.node?.name ?? "<unnamed>"):", sampleTimes)
+
+        let sampleCount = sampleTimes.count
+        guard sampleCount > 0 else { return [] }
+        guard weightValues.count % sampleCount == 0 else { return [] }
+
+        let weightsPerSample = weightValues.count / sampleCount
+        guard weightsPerSample > 0 else { return [] }
+
+        var frames = [BlendShapeWeights]()
+        frames.reserveCapacity(sampleCount)
+        var framesBySet = [BlendShapeWeightsData.ID: [BlendShapeWeights]]()
+        for (id, _) in info.setInfos {
+            framesBySet[id] = []
+        }
+
+        for sampleIndex in 0..<sampleCount {
+            let baseIndex = sampleIndex * weightsPerSample
+            var valuesByName = [String: Float]()
+            valuesByName.reserveCapacity(info.weightNames.count)
+
+            for (nameIndex, name) in info.weightNames.enumerated() {
+                let value: Float
+                if nameIndex < weightsPerSample {
+                    value = weightValues[baseIndex + nameIndex]
+                } else if nameIndex < defaultWeights.count {
+                    value = defaultWeights[nameIndex]
+                } else {
+                    value = 0.0
+                }
+                valuesByName[name] = value
+            }
+
+            let orderedValues = info.weightNames.map { valuesByName[$0] ?? 0.0 }
+            frames.append(BlendShapeWeights(orderedValues))
+
+            for (id, names) in info.setInfos {
+                let values = names.map { valuesByName[$0] ?? 0.0 }
+                framesBySet[id, default: []].append(BlendShapeWeights(values))
+            }
+        }
+
+        var frameInterval: Float = 1 / 30.0
+        if sampleCount > 1 {
+            let totalDuration = sampleTimes[ sampleTimes.count - 1 ] - sampleTimes[0]
+            if totalDuration > 0 {
+                frameInterval = totalDuration / Float(sampleCount - 1)
+            } else {
+                var minInterval = Float.greatestFiniteMagnitude
+                for index in 1..<sampleTimes.count {
+                    let delta = sampleTimes[index] - sampleTimes[index - 1]
+                    if delta > 0 {
+                        minInterval = min(minInterval, delta)
+                    }
+                }
+                if minInterval.isFinite && minInterval > 0 {
+                    frameInterval = minInterval
+                }
+            }
+        }
+
+        let tweenMode: TweenMode = sampler.interpolationMode == .step ? .hold : .linear
+        let delay = TimeInterval(sampleTimes.first ?? 0.0)
+
+        print("[GLTFKit2][Debug] Generated blend shape animation for \(weightChannel.target.node?.name ?? "<unnamed>") with \(frames.count) frames and \(info.weightNames.count) weights")
+
+        if info.setInfos.isEmpty {
+            let animation = SampledAnimation(weightNames: info.weightNames,
+                                             frames: frames,
+                                             tweenMode: tweenMode,
+                                             frameInterval: frameInterval,
+                                             bindTarget: entityPath.blendShapeWeights(),
+                                             repeatMode: .repeat,
+                                             delay: delay)
+            if let firstFrame = frames.first {
+                let values = Array(firstFrame)
+                print("[GLTFKit2][Debug] First blend-shape frame for \(weightChannel.target.node?.name ?? "<unnamed>"):", values)
+            }
+            return [animation]
+        } else {
+            var animations = [AnimationDefinition]()
+            for (id, names) in info.setInfos {
+                guard let setFrames = framesBySet[id], !setFrames.isEmpty else { continue }
+                let animation = SampledAnimation(weightNames: names,
+                                                 frames: setFrames,
+                                                 tweenMode: tweenMode,
+                                                 frameInterval: frameInterval,
+                                                 bindTarget: entityPath.blendShapeWeightsWithID(id),
+                                                 repeatMode: .repeat,
+                                                 delay: delay)
+                animations.append(animation)
+                if let first = setFrames.first {
+                    print("[GLTFKit2][Debug] First blend-shape frame for set \(id) on \(weightChannel.target.node?.name ?? "<unnamed>"):", Array(first))
+                }
+            }
+            if animations.isEmpty {
+                let animation = SampledAnimation(weightNames: info.weightNames,
+                                                 frames: frames,
+                                                 tweenMode: tweenMode,
+                                                 frameInterval: frameInterval,
+                                                 bindTarget: entityPath.blendShapeWeights(),
+                                                 repeatMode: .repeat,
+                                                 delay: delay)
+                return [animation]
+            }
+            return animations
+        }
+    }
+
+    @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+    private func convertWeightAnimations(for node: GLTFNode,
+                                         mesh: GLTFMesh,
+                                         channels: [GLTFAnimationChannel]) -> [AnimationDefinition]
+    {
+        let weightChannels = channels.filter { $0.target.path == GLTFAnimationPath.weights.rawValue }
+        guard !weightChannels.isEmpty else { return [] }
+
+        let meshIdentifier = ObjectIdentifier(mesh)
+        guard let info = blendShapeInfo(for: meshIdentifier), !info.weightNames.isEmpty else {
+            return []
+        }
+
+        let defaultWeights = defaultBlendShapeWeights(for: node)
+
+        var animations = [AnimationDefinition]()
+        for weightChannel in weightChannels {
+            animations.append(contentsOf: convert(weightChannel: weightChannel,
+                                                  info: info,
+                                                  defaultWeights: defaultWeights,
+                                                  entityPath: node.bindPath))
+        }
+        return animations
+    }
+#endif
 
     func platformColor(for vector: simd_float4) -> PlatformColor {
 #if os(macOS)
