@@ -381,6 +381,10 @@ class GLTFRealityKitResourceContext {
     let commandQueue: MTLCommandQueue
     private var cgImagesForImageIdentifiers = [UUID : CGImage]()
     private var textureResourcesForImageIdentifiers = [UUID : [(RealityKit.TextureResource, ColorMask)]]()
+    #if compiler(>=6.0) || os(visionOS)
+    var jointIndexRemapsBySkeletonID: [String: [UInt16]] = [:]
+    var restPoseTransformsBySkeletonID: [String: [Transform]] = [:]
+    #endif
 
     var defaultMaterial: any Material {
         return RealityKit.SimpleMaterial(color: .init(white: 0.5, alpha: 1.0), isMetallic: false)
@@ -570,6 +574,11 @@ public class GLTFRealityKitLoader {
     private var pathsForSkeletonIDs: [/*MeshResource.Skeleton.ID*/String : BindTarget.EntityPath] = [:]
     private var skeletonIDsByJointName: [String: [/*MeshResource.Skeleton.ID*/String]] = [:]
     private var skeletonTransformsByJointName : [String: Transform] = [:]
+    #if compiler(>=6.0) || os(visionOS)
+    private var jointNamesBySkeletonID: [String: [String]] = [:]
+    private var restPoseTransformsBySkeletonID: [String: [Transform]] = [:]
+    private var ancestorChainsBySkeletonID: [String: [String: [GLTFNode]]] = [:]
+    #endif
 
     public static func load(from url: URL) async throws -> RealityKit.Entity {
         let asset = try GLTFAsset(url: url)
@@ -634,7 +643,7 @@ public class GLTFRealityKitLoader {
         #if compiler(>=6.0)
         if #available(macOS 15.0, iOS 18.0, visionOS 2.0, *) {
             if let skin = gltfNode.skin {
-                if let meshSkeleton = convert(skin: skin, context: context) {
+                if let meshSkeleton = convert(skin: skin, bindingNode: gltfNode, context: context) {
                     skeleton = meshSkeleton
                     // Cache some associations between joints, entities, and skeletons so we can look them up later.
                     pathsForSkeletonIDs[meshSkeleton.id] = gltfNode.bindPath
@@ -687,28 +696,189 @@ public class GLTFRealityKitLoader {
 
     #if compiler(>=6.0) || os(visionOS)
     @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
-    func convert(skin gltfSkin: GLTFSkin, context: GLTFRealityKitResourceContext) -> MeshResource.Skeleton? {
+    func convert(skin gltfSkin: GLTFSkin, bindingNode _: GLTFNode, context: GLTFRealityKitResourceContext) -> MeshResource.Skeleton? {
         let skeletonName = gltfSkin.name ?? nameGenerator.nextUniqueName(prefix: "Skin")
-        let jointNames = gltfSkin.joints.compactMap { return $0.name }
+        let joints = gltfSkin.joints
 
-        let jointParents = gltfSkin.joints.map { skeletonNode in
-            if let parent = skeletonNode.parent {
-                return gltfSkin.joints.firstIndex(of: parent)
-            } else {
+        guard !joints.isEmpty else {
+            #if DEBUG
+            print("[GLTFKit2] Skipping skeleton generation for skin \(skeletonName) with no joints")
+            #endif
+            return nil
+        }
+
+        if joints.count > Int(UInt16.max) {
+            #if DEBUG
+            print("[GLTFKit2] Skin \(skeletonName) has more joints than supported (\(joints.count) > 65535)")
+            #endif
+            return nil
+        }
+
+        let originalIndexByJointID = Dictionary(uniqueKeysWithValues: joints.enumerated().map { (ObjectIdentifier($0.element), $0.offset) })
+        let jointIDSet = Set(originalIndexByJointID.keys)
+
+        let ancestorChainsByJointID: [ObjectIdentifier: [GLTFNode]] = {
+            var result = [ObjectIdentifier: [GLTFNode]]()
+            for joint in joints {
+                var chain: [GLTFNode] = []
+                var parent = joint.parent
+                while let currentParent = parent {
+                    let parentID = ObjectIdentifier(currentParent)
+                    if jointIDSet.contains(parentID) {
+                        break
+                    }
+                    chain.append(currentParent)
+                    parent = currentParent.parent
+                }
+                result[ObjectIdentifier(joint)] = chain
+            }
+            return result
+        }()
+
+        let orderedJoints: [GLTFNode] = {
+            var ordered: [GLTFNode] = []
+            var visited = Set<ObjectIdentifier>()
+
+            func traverse(_ joint: GLTFNode) {
+                let identifier = ObjectIdentifier(joint)
+                if visited.contains(identifier) { return }
+                visited.insert(identifier)
+                ordered.append(joint)
+
+                let childNodes = joint.childNodes.filter { jointIDSet.contains(ObjectIdentifier($0)) }
+                let sortedChildren = childNodes.sorted {
+                    let lhsIndex = originalIndexByJointID[ObjectIdentifier($0)] ?? Int.max
+                    let rhsIndex = originalIndexByJointID[ObjectIdentifier($1)] ?? Int.max
+                    return lhsIndex < rhsIndex
+                }
+                for child in sortedChildren {
+                    traverse(child)
+                }
+            }
+
+            let roots = joints.filter { joint in
+                guard let parent = joint.parent else { return true }
+                return !jointIDSet.contains(ObjectIdentifier(parent))
+            }
+
+            for root in roots {
+                traverse(root)
+            }
+
+            for joint in joints where !visited.contains(ObjectIdentifier(joint)) {
+                traverse(joint)
+            }
+
+            return ordered
+        }()
+
+        guard orderedJoints.count == joints.count else {
+            #if DEBUG
+            print("[GLTFKit2] Unable to determine a complete joint ordering for skin \(skeletonName)")
+            #endif
+            return nil
+        }
+
+        var jointIndexRemap = [UInt16](repeating: 0, count: joints.count)
+        for (newIndex, joint) in orderedJoints.enumerated() {
+            guard let originalIndex = originalIndexByJointID[ObjectIdentifier(joint)],
+                  let remappedIndex = UInt16(exactly: newIndex) else {
+                #if DEBUG
+                print("[GLTFKit2] Failed to remap joint indices for skin \(skeletonName)")
+                #endif
                 return nil
+            }
+            jointIndexRemap[originalIndex] = remappedIndex
+        }
+
+        var jointNames: [String] = orderedJoints.map { joint in
+            if let existingName = joint.name, !existingName.isEmpty {
+                return existingName
+            }
+            let generatedName = nameGenerator.nextUniqueName(prefix: "Joint")
+            joint.name = generatedName
+            return generatedName
+        }
+
+        var jointParents: [Int?] = orderedJoints.map { joint in
+            guard let parent = joint.parent else { return nil }
+            guard let originalParentIndex = originalIndexByJointID[ObjectIdentifier(parent)] else { return nil }
+            return Int(jointIndexRemap[originalParentIndex])
+        }
+
+        let originalIBMMatrices: [simd_float4x4] = {
+            guard let ibmAccessor = gltfSkin.inverseBindMatrices,
+                  let matrices = packedFloat4x4(for: ibmAccessor),
+                  matrices.count >= joints.count else {
+                return [simd_float4x4](repeating: matrix_identity_float4x4, count: joints.count)
+            }
+            return matrices
+        }()
+
+        var ibmMatrices = [simd_float4x4](repeating: matrix_identity_float4x4, count: orderedJoints.count)
+        var restTransforms = [Transform](repeating: Transform(), count: orderedJoints.count)
+        var ancestorChainsByJointName = [String: [GLTFNode]]()
+
+        for (newIndex, joint) in orderedJoints.enumerated() {
+            let identifier = ObjectIdentifier(joint)
+            ancestorChainsByJointName[jointNames[newIndex]] = ancestorChainsByJointID[identifier] ?? []
+
+            if let originalIndex = originalIndexByJointID[identifier], originalIndex < originalIBMMatrices.count {
+                ibmMatrices[newIndex] = originalIBMMatrices[originalIndex]
+            }
+
+            restTransforms[newIndex] = Transform(matrix: joint.matrix)
+        }
+
+        let rootCount = jointParents.reduce(0) { $0 + ($1 == nil ? 1 : 0) }
+        if rootCount > 1 {
+            let syntheticRootName = nameGenerator.nextUniqueName(prefix: "\(skeletonName)_Root")
+            jointNames.insert(syntheticRootName, at: 0)
+            jointParents = [nil] + jointParents.map { parentIndex -> Int? in
+                if let parentIndex = parentIndex {
+                    return parentIndex + 1
+                } else {
+                    return 0
+                }
+            }
+            ibmMatrices.insert(matrix_identity_float4x4, at: 0)
+            restTransforms.insert(Transform(), at: 0)
+            ancestorChainsByJointName[syntheticRootName] = []
+
+            jointIndexRemap = jointIndexRemap.map { originalIndex in
+                let incremented = Int(originalIndex) + 1
+                if let remapped = UInt16(exactly: incremented) {
+                    return remapped
+                } else {
+                    #if DEBUG
+                    print("[GLTFKit2] Joint index remap overflow when adding synthetic root to skin \(skeletonName)")
+                    #endif
+                    return originalIndex
+                }
             }
         }
 
-        let ibmMatrices = {
-            if let ibmAccessor = gltfSkin.inverseBindMatrices, let matrices = packedFloat4x4(for: ibmAccessor) {
-                return matrices
-            } else {
-                return [simd_float4x4](repeating: matrix_identity_float4x4, count: jointNames.count)
-            }
-        }()
+        let jointCount = jointNames.count
 
-        return MeshResource.Skeleton(id: skeletonName, jointNames: jointNames,
-                                     inverseBindPoseMatrices: ibmMatrices, parentIndices: jointParents)
+        guard jointParents.count == jointCount, ibmMatrices.count == jointCount else {
+            #if DEBUG
+            print("[GLTFKit2] Invalid skeleton data for skin \(skeletonName); joint metadata lengths do not match")
+            #endif
+            return nil
+        }
+
+        #if compiler(>=6.0) || os(visionOS)
+        context.jointIndexRemapsBySkeletonID[skeletonName] = jointIndexRemap
+        context.restPoseTransformsBySkeletonID[skeletonName] = restTransforms
+        jointNamesBySkeletonID[skeletonName] = jointNames
+        restPoseTransformsBySkeletonID[skeletonName] = restTransforms
+        ancestorChainsBySkeletonID[skeletonName] = ancestorChainsByJointName
+        #endif
+
+        return MeshResource.Skeleton(id: skeletonName,
+                                     jointNames: jointNames,
+                                     inverseBindPoseMatrices: ibmMatrices,
+                                     parentIndices: jointParents)
     }
     #endif
 
@@ -804,23 +974,44 @@ public class GLTFRealityKitLoader {
         if #available(macOS 15.0, iOS 18.0, *) {
             if let joints0Attribute = gltfPrimitive.attribute(forName: "JOINTS_0"),
                let weights0Attribute = gltfPrimitive.attribute(forName: "WEIGHTS_0"),
-               let jointsArray = packedUShort4Array(for: joints0Attribute.accessor),
-               let weightsArray = packedFloat4Array(for: weights0Attribute.accessor)
+               let jointsArray0 = packedUShort4Array(for: joints0Attribute.accessor),
+               let weightsArray0 = packedFloat4Array(for: weights0Attribute.accessor)
             {
-                let weightsPerVertex = 4
-                func jointInfluences(forJoints joints: [SIMD4<UInt16>], weights: [SIMD4<Float>]) -> [MeshJointInfluence] {
-                    return zip(joints, weights).reduce(into: [MeshJointInfluence]()) { partialResult, jointsAndWeights in
-                        let joints = jointsAndWeights.0; let weights = jointsAndWeights.1
-                        partialResult.append(MeshJointInfluence(jointIndex: Int(joints[0]), weight: weights[0]))
-                        partialResult.append(MeshJointInfluence(jointIndex: Int(joints[1]), weight: weights[1]))
-                        partialResult.append(MeshJointInfluence(jointIndex: Int(joints[2]), weight: weights[2]))
-                        partialResult.append(MeshJointInfluence(jointIndex: Int(joints[3]), weight: weights[3]))
+                let jointIndexRemap = skeletonID.flatMap { context.jointIndexRemapsBySkeletonID[$0] }
+
+                func remappedIndex(for original: UInt16) -> UInt16 {
+                    guard let remap = jointIndexRemap else { return original }
+                    let index = Int(original)
+                    return index < remap.count ? remap[index] : original
+                }
+
+                let vertexCount = jointsArray0.count
+                var influences = [MeshJointInfluence]()
+                influences.reserveCapacity(vertexCount * 8)
+
+                func appendInfluences(jointVectors: [SIMD4<UInt16>], weightVectors: [SIMD4<Float>]) {
+                    for (jointVector, weightVector) in zip(jointVectors, weightVectors) {
+                        influences.append(MeshJointInfluence(jointIndex: Int(remappedIndex(for: jointVector[0])), weight: weightVector[0]))
+                        influences.append(MeshJointInfluence(jointIndex: Int(remappedIndex(for: jointVector[1])), weight: weightVector[1]))
+                        influences.append(MeshJointInfluence(jointIndex: Int(remappedIndex(for: jointVector[2])), weight: weightVector[2]))
+                        influences.append(MeshJointInfluence(jointIndex: Int(remappedIndex(for: jointVector[3])), weight: weightVector[3]))
                     }
                 }
 
-                let influences = jointInfluences(forJoints: jointsArray, weights: weightsArray)
+                appendInfluences(jointVectors: jointsArray0, weightVectors: weightsArray0)
+
+                var influencesPerVertex = 4
+                if let joints1Attribute = gltfPrimitive.attribute(forName: "JOINTS_1"),
+                   let weights1Attribute = gltfPrimitive.attribute(forName: "WEIGHTS_1"),
+                   let jointsArray1 = packedUShort4Array(for: joints1Attribute.accessor),
+                   let weightsArray1 = packedFloat4Array(for: weights1Attribute.accessor)
+                {
+                    appendInfluences(jointVectors: jointsArray1, weightVectors: weightsArray1)
+                    influencesPerVertex = 8
+                }
+
                 part.jointInfluences = MeshResource.JointInfluences(influences: MeshBuffers.JointInfluences(influences),
-                                                                    influencesPerVertex: weightsPerVertex)
+                                                                    influencesPerVertex: influencesPerVertex)
                 part.skeletonID = skeletonID
             }
         }
@@ -978,6 +1169,7 @@ public class GLTFRealityKitLoader {
             var sampleInterval: Float = 1 / 30.0
         }
         var jointAnimation = AnimatedJointData()
+        var transformSamplersByNodeID = [ObjectIdentifier: GLTFTransformSampler]()
         var animations = [AnimationDefinition]()
         for (_, channels) in groupedChannels {
             if let _ = channels.first(where: { $0.target.path == GLTFAnimationPath.weights.rawValue }), channels.count == 1 {
@@ -994,6 +1186,7 @@ public class GLTFRealityKitLoader {
                                                         rotationChannel: rotationChannel,
                                                         scaleChannel: scaleChannel,
                                                         maximumSampleInterval: 1 / 30.0) // TODO: Make sample interval an option
+            transformSamplersByNodeID[ObjectIdentifier(targetNode)] = transformSampler
             if targetNode.isJoint {
                 jointAnimation.jointNames.append(targetNode.name!)
                 jointAnimation.jointTransformSamplers.append(transformSampler)
@@ -1016,17 +1209,24 @@ public class GLTFRealityKitLoader {
             }
         }
         if !jointAnimation.jointNames.isEmpty {
-            var jointTransforms = [JointTransforms]()
-            for t in stride(from: jointAnimation.minTime, through: jointAnimation.maxTime, by: jointAnimation.sampleInterval) {
-                let sampledTransforms = zip(jointAnimation.jointNames, jointAnimation.jointTransformSamplers).map { jointName, transformSampler -> Transform in
-                    var jointTransform = transformSampler.transform(at: t)
-                    if let ancestorTransform = skeletonTransformsByJointName[jointName] {
-                        jointTransform = Transform(matrix: ancestorTransform.matrix * jointTransform.matrix)
-                    }
-                    return jointTransform
-                }
-                jointTransforms.append(JointTransforms(sampledTransforms))
+            var sampleTimes = Array(stride(from: jointAnimation.minTime,
+                                           through: jointAnimation.maxTime,
+                                           by: jointAnimation.sampleInterval))
+            if sampleTimes.isEmpty {
+                sampleTimes = [jointAnimation.minTime]
             }
+            let sampleCount = sampleTimes.count
+
+            var sampledTransformsByJointName = [String: [Transform]]()
+            for (jointName, transformSampler) in zip(jointAnimation.jointNames, jointAnimation.jointTransformSamplers) {
+                var samples = [Transform]()
+                samples.reserveCapacity(sampleCount)
+                for t in sampleTimes {
+                    samples.append(transformSampler.transform(at: t))
+                }
+                sampledTransformsByJointName[jointName] = samples
+            }
+
             let delay = TimeInterval(jointAnimation.minTime)
 
             var animatedSkeletonIDs = Set</*MeshResource.Skeleton.ID*/String>()
@@ -1035,10 +1235,48 @@ public class GLTFRealityKitLoader {
                     animatedSkeletonIDs.formUnion(skeletonIDs)
                 }
             }
-            let animatedBindPaths = animatedSkeletonIDs.compactMap { pathsForSkeletonIDs[$0] }
-            for bindPath in animatedBindPaths {
-                let skeletalAnimation = SampledAnimation(jointNames: jointAnimation.jointNames,
-                                                         frames: jointTransforms,
+
+            for skeletonID in animatedSkeletonIDs {
+                guard let bindPath = pathsForSkeletonIDs[skeletonID],
+                      let orderedJointNames = jointNamesBySkeletonID[skeletonID] else {
+                    continue
+                }
+
+                let ancestorChains = ancestorChainsBySkeletonID[skeletonID] ?? [:]
+                let restTransforms = restPoseTransformsBySkeletonID[skeletonID] ?? []
+                let jointIndexByName = Dictionary(uniqueKeysWithValues: orderedJointNames.enumerated().map { ($1, $0) })
+
+                let jointFrames = (0..<sampleCount).map { sampleIndex -> JointTransforms in
+                    let transforms = orderedJointNames.map { jointName -> Transform in
+                        let baseTransform: Transform
+                        if let samples = sampledTransformsByJointName[jointName], sampleIndex < samples.count {
+                            baseTransform = samples[sampleIndex]
+                        } else if let index = jointIndexByName[jointName], restTransforms.indices.contains(index) {
+                            baseTransform = restTransforms[index]
+                        } else {
+                            baseTransform = Transform()
+                        }
+
+                        var matrix = baseTransform.matrix
+                        if let ancestors = ancestorChains[jointName] {
+                            for ancestor in ancestors.reversed() {
+                                let ancestorMatrix: simd_float4x4
+                                if let sampler = transformSamplersByNodeID[ObjectIdentifier(ancestor)] {
+                                    ancestorMatrix = sampler.transform(at: sampleTimes[sampleIndex]).matrix
+                                } else {
+                                    ancestorMatrix = ancestor.matrix
+                                }
+                                matrix = ancestorMatrix * matrix
+                            }
+                        }
+
+                        return Transform(matrix: matrix)
+                    }
+                    return JointTransforms(transforms)
+                }
+
+                let skeletalAnimation = SampledAnimation(jointNames: orderedJointNames,
+                                                         frames: jointFrames,
                                                          tweenMode: .linear, // TODO: Support .hold?
                                                          frameInterval: jointAnimation.sampleInterval,
                                                          bindTarget: bindPath.jointTransforms,
