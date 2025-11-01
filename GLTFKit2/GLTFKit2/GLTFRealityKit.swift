@@ -1308,26 +1308,29 @@ public class GLTFRealityKitLoader {
                                                         scaleChannel: scaleChannel,
                                                         maximumSampleInterval: 1 / 30.0) // TODO: Make sample interval an option
             transformSamplersByNodeID[ObjectIdentifier(targetNode)] = transformSampler
+
+            let transformFrames = stride(from: transformSampler.startTime,
+                                         through: transformSampler.endTime,
+                                         by: transformSampler.recommendedSampleInterval).map { time in
+                transformSampler.transform(at: time)
+            }
+
+            if !transformFrames.isEmpty {
+                let transformAnimation = SampledAnimation(frames: transformFrames,
+                                                          tweenMode: transformSampler.hasStepChannel ? .hold : .linear,
+                                                          frameInterval: transformSampler.recommendedSampleInterval,
+                                                          bindTarget: targetNode.bindPath.transform,
+                                                          repeatMode: .repeat,
+                                                          delay: TimeInterval(transformSampler.startTime))
+                animations.append(transformAnimation)
+            }
+
             if targetNode.isJoint {
                 jointAnimation.jointNames.append(targetNode.name!)
                 jointAnimation.jointTransformSamplers.append(transformSampler)
                 jointAnimation.minTime = min(jointAnimation.minTime, transformSampler.startTime)
                 jointAnimation.maxTime = max(jointAnimation.maxTime, transformSampler.endTime)
                 jointAnimation.sampleInterval = min(jointAnimation.sampleInterval, transformSampler.recommendedSampleInterval)
-            } else {
-                let frames = stride(from: transformSampler.startTime,
-                                    through: transformSampler.endTime,
-                                    by: transformSampler.recommendedSampleInterval).map
-                {
-                    transformSampler.transform(at: $0)
-                }
-                let sampledAnimation = SampledAnimation(frames: frames,
-                                                        tweenMode: transformSampler.hasStepChannel ? .hold : .linear,
-                                                        frameInterval: transformSampler.recommendedSampleInterval,
-                                                        bindTarget: targetNode.bindPath.transform,
-                                                        repeatMode: .repeat,
-                                                        delay: TimeInterval(transformSampler.startTime))
-                animations.append(sampledAnimation)
             }
         }
         if !jointAnimation.jointNames.isEmpty {
