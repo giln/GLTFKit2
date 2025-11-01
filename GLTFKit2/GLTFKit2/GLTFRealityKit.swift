@@ -110,6 +110,8 @@ func packedFloat3Array(for accessor: GLTFAccessor) -> [SIMD3<Float>]? {
     let componentCount = (accessor.dimension == .vector4) ? 4 : 3
     let vectorCount = accessor.count
 
+    // Use the shared helper so sparse accessors are expanded to their dense
+    // representation before we reinterpret the bytes as floats.
     let packedData = GLTFPackedDataForAccessor(accessor) as Data
     let floatData = GLTFTransformPackedDataToFloat(packedData, accessor) as Data
 
@@ -353,6 +355,9 @@ fileprivate class UniqueNameGenerator {
 }
 
 #if compiler(>=6.0) || os(visionOS)
+/// Tracks the RealityKit identifiers and ordering that we assign to a mesh's
+/// blend shapes so later animation and entity wiring can address them
+/// consistently.
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 fileprivate struct BlendShapeInfo {
     var weightNames: [String]
@@ -582,6 +587,9 @@ public class GLTFRealityKitLoader {
     private var jointNamesBySkeletonID: [String: [String]] = [:]
     private var restPoseTransformsBySkeletonID: [String: [Transform]] = [:]
     private var ancestorChainsBySkeletonID: [String: [String: [GLTFNode]]] = [:]
+    /// RealityKit only exposes blend-shape bindings via generated identifiers,
+    /// so we memoise per-mesh metadata here to rehydrate weight sets when
+    /// meshes are instanced in the entity graph.
     private var blendShapeInfoStorage = [ObjectIdentifier: Any]()
 #endif
 
@@ -696,13 +704,15 @@ public class GLTFRealityKitLoader {
                     var blendShapeComponent = BlendShapeWeightsComponent(weightsMapping: BlendShapeWeightsMapping(meshResource: meshComponent.mesh))
                     var weightSet = blendShapeComponent.weightSet
                     if !weightSet.isEmpty {
-                        print("[GLTFKit2][Debug] Blend shape weight set count for \(gltfMesh.name ?? "<unnamed>"):", weightSet.count)
-
+                        // Seed the component with the glTF default weights so the
+                        // entity matches the authoring pose before animation
+                        // begins and cache the ordering RealityKit assigned to
+                        // each weight set.
                         let defaultWeights = defaultBlendShapeWeights(for: gltfNode)
                         var weightsByName = [String: Float]()
-                        for (index, name) in blendShapeInfo.weightNames.enumerated() {
-                            if index < defaultWeights.count {
-                                weightsByName[name] = defaultWeights[index]
+                    for (index, name) in blendShapeInfo.weightNames.enumerated() {
+                        if index < defaultWeights.count {
+                            weightsByName[name] = defaultWeights[index]
                             } else {
                                 weightsByName[name] = 0.0
                             }
@@ -711,7 +721,6 @@ public class GLTFRealityKitLoader {
                         var setInfos = [BlendShapeWeightsData.ID: [String]]()
                         for data in weightSet {
                             let names = data.weightNames
-                            print("[GLTFKit2][Debug] Weight set \(data.id) names: \(names)")
                             let values = names.map { weightsByName[$0] ?? 0.0 }
                             var updated = data
                             updated.weights = BlendShapeWeights(values)
@@ -926,6 +935,8 @@ public class GLTFRealityKitLoader {
            let maxTargetCount = gltfMesh.primitives.map({ $0.targets.count }).max(),
            maxTargetCount > 0
         {
+            // RealityKit expects deterministic labels for every blend shape
+            // across a mesh, so derive a unique name for each target up-front.
             let providedNames = gltfMesh.targetNames ?? []
             var usedNames = Set<String>()
             blendShapeNames = (0..<maxTargetCount).map { index -> String in
@@ -1053,28 +1064,26 @@ public class GLTFRealityKitLoader {
            !gltfPrimitive.targets.isEmpty,
            vertexCount > 0
         {
-            print("[GLTFKit2][Debug] Processing primitive \(partName) with \(gltfPrimitive.targets.count) morph targets (vertexCount=\(vertexCount))")
             for (targetIndex, targetAttributes) in gltfPrimitive.targets.enumerated() {
                 guard targetIndex < blendShapeNames.count else { break }
 
                 guard let positionAttribute = targetAttributes.first(where: { $0.name == "POSITION" }) else {
-                    print("[GLTFKit2][Debug] Skipping target #\(targetIndex) for \(partName); POSITION attribute not found (available: \(targetAttributes.map { $0.name ?? "<nil>" }))")
                     continue
                 }
 
                 guard let offsets = packedFloat3Array(for: positionAttribute.accessor) else {
-                    print("[GLTFKit2][Debug] Skipping target #\(targetIndex) for \(partName); unable to read POSITION accessor")
                     continue
                 }
 
                 guard offsets.count == vertexCount else {
-                    print("[GLTFKit2][Debug] Skipping target #\(targetIndex) for \(partName); vertex count mismatch offsets=\(offsets.count) expected=\(vertexCount)")
                     continue
                 }
 
+                // RealityKit expects absolute offsets, so decode the accessor
+                // (handling sparse encodings) and stash them under the target
+                // name we assigned above.
                 part[MeshBuffers.blendShapeOffsets(named: blendShapeNames[targetIndex])] = MeshBuffers.BlendShapeOffsets(offsets)
                 emittedBlendShapeOffsets = true
-                print("[GLTFKit2][Debug] Added blend shape offsets for target \(blendShapeNames[targetIndex]) with \(offsets.count) vertices")
             }
         }
         #endif
@@ -1316,6 +1325,10 @@ public class GLTFRealityKitLoader {
             }
 
             if !transformFrames.isEmpty {
+                // Even when a mesh is skinned, the authoring rig often keeps
+                // attachments (eyes, teeth, accessories) as child nodes of the
+                // head. Baking node animations ensures those attachments follow
+                // the driven skeleton.
                 let transformAnimation = SampledAnimation(frames: transformFrames,
                                                           tweenMode: transformSampler.hasStepChannel ? .hold : .linear,
                                                           frameInterval: transformSampler.recommendedSampleInterval,
@@ -1430,8 +1443,6 @@ public class GLTFRealityKitLoader {
             return []
         }
 
-        print("[GLTFKit2][Debug] Weight channel sample times for \(weightChannel.target.node?.name ?? "<unnamed>"):", sampleTimes)
-
         let sampleCount = sampleTimes.count
         guard sampleCount > 0 else { return [] }
         guard weightValues.count % sampleCount == 0 else { return [] }
@@ -1439,6 +1450,9 @@ public class GLTFRealityKitLoader {
         let weightsPerSample = weightValues.count / sampleCount
         guard weightsPerSample > 0 else { return [] }
 
+        // Build a dense frame table for the overall weight order as well as
+        // each RealityKit weight set so we can drive either binding depending
+        // on what the mesh exposes.
         var frames = [BlendShapeWeights]()
         frames.reserveCapacity(sampleCount)
         var framesBySet = [BlendShapeWeightsData.ID: [BlendShapeWeights]]()
@@ -1494,8 +1508,6 @@ public class GLTFRealityKitLoader {
         let tweenMode: TweenMode = sampler.interpolationMode == .step ? .hold : .linear
         let delay = TimeInterval(sampleTimes.first ?? 0.0)
 
-        print("[GLTFKit2][Debug] Generated blend shape animation for \(weightChannel.target.node?.name ?? "<unnamed>") with \(frames.count) frames and \(info.weightNames.count) weights")
-
         if info.setInfos.isEmpty {
             let animation = SampledAnimation(weightNames: info.weightNames,
                                              frames: frames,
@@ -1504,10 +1516,6 @@ public class GLTFRealityKitLoader {
                                              bindTarget: entityPath.blendShapeWeights(),
                                              repeatMode: .repeat,
                                              delay: delay)
-            if let firstFrame = frames.first {
-                let values = Array(firstFrame)
-                print("[GLTFKit2][Debug] First blend-shape frame for \(weightChannel.target.node?.name ?? "<unnamed>"):", values)
-            }
             return [animation]
         } else {
             var animations = [AnimationDefinition]()
@@ -1521,9 +1529,6 @@ public class GLTFRealityKitLoader {
                                                  repeatMode: .repeat,
                                                  delay: delay)
                 animations.append(animation)
-                if let first = setFrames.first {
-                    print("[GLTFKit2][Debug] First blend-shape frame for set \(id) on \(weightChannel.target.node?.name ?? "<unnamed>"):", Array(first))
-                }
             }
             if animations.isEmpty {
                 let animation = SampledAnimation(weightNames: info.weightNames,
@@ -1556,6 +1561,10 @@ public class GLTFRealityKitLoader {
 
         var animations = [AnimationDefinition]()
         for weightChannel in weightChannels {
+            // Each channel updates either the aggregate blend weight array or a
+            // specific weight set (for meshes with multiple materials), so we
+            // emit the appropriate SampledAnimation objects for whichever case
+            // applies.
             animations.append(contentsOf: convert(weightChannel: weightChannel,
                                                   info: info,
                                                   defaultWeights: defaultWeights,
