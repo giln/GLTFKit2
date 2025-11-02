@@ -219,8 +219,18 @@ class GLTFTransformSampler {
         rotation = GLTFAnimatedQuaternion(keyTimes: rotationTimes, values: rotationValues, interpolation: rotationInterp)
         scale = GLTFAnimatedVector3(keyTimes: scaleTimes, values: scaleValues, interpolation: scaleInterp)
 
-        let duration = maxTime - minTime
-        let averageKeyDuration = duration / Float(max(translationTimes.count, max(rotationTimes.count, scaleTimes.count)))
-        recommendedSampleInterval = averageKeyDuration > maximumSampleInterval ? maximumSampleInterval : averageKeyDuration
+        // When animations collapse to a single keyframe GLTF often keeps the
+        // min/max time equal. Guard against that so walking the samples with
+        // `stride(from:through:by:)` never sees a zero increment.
+        let duration = max(Float(0), maxTime - minTime)
+        let keyCount = max(translationTimes.count, max(rotationTimes.count, scaleTimes.count))
+        let segmentCount = max(keyCount - 1, 1)
+        let rawInterval = duration / Float(segmentCount)
+
+        // Keep the sampling stride positive so downstream `stride(from:through:by:)`
+        // calls never crash (this previously triggered `Stride size must not be zero`
+        // inside `generate(animation:)` when a clip only provided bind-pose keys).
+        let safeInterval = rawInterval > 0 ? rawInterval : maximumSampleInterval
+        recommendedSampleInterval = min(safeInterval, maximumSampleInterval)
     }
 }
