@@ -586,7 +586,6 @@ public class GLTFRealityKitLoader {
     #if compiler(>=6.0) || os(visionOS)
     private var jointNamesBySkeletonID: [String: [String]] = [:]
     private var restPoseTransformsBySkeletonID: [String: [Transform]] = [:]
-    private var ancestorChainsBySkeletonID: [String: [String: [GLTFNode]]] = [:]
     /// RealityKit only exposes blend-shape bindings via generated identifiers,
     /// so we memoise per-mesh metadata here to rehydrate weight sets when
     /// meshes are instanced in the entity graph.
@@ -820,6 +819,27 @@ public class GLTFRealityKitLoader {
             return transform
         }
 
+        var providedInverseBindMatricesByNode = [ObjectIdentifier: simd_float4x4]()
+        if let accessor = gltfSkin.inverseBindMatrices,
+           let matrices = packedFloat4x4(for: accessor)
+        {
+            // Honour author-supplied inverse bind matrices when available so we
+            // don't lose non-trivial skeleton offsets (common in rigs that bind
+            // meshes in local pose space).
+            if matrices.count < joints.count {
+                #if DEBUG
+                print("[GLTFKit2] Skin \(skeletonName) inverse bind matrix count (\(matrices.count)) shorter than joint list (\(joints.count)); truncating")
+                #endif
+            } else if matrices.count > joints.count {
+                #if DEBUG
+                print("[GLTFKit2] Skin \(skeletonName) inverse bind matrix count (\(matrices.count)) longer than joint list (\(joints.count)); extra entries ignored")
+                #endif
+            }
+            for (joint, matrix) in zip(joints, matrices) {
+                providedInverseBindMatricesByNode[ObjectIdentifier(joint)] = matrix
+            }
+        }
+
         var jointNames = [String]()
         var parentIndices = [Int?]()
         var inverseBindMatrices = [simd_float4x4]()
@@ -853,7 +873,13 @@ public class GLTFRealityKitLoader {
             indexByNodeID[identifier] = index
             jointNames.append(name)
             parentIndices.append(parentIndex)
-            inverseBindMatrices.append(simd_inverse(worldTransform(for: node)))
+            let inverseBindMatrix: simd_float4x4
+            if let provided = providedInverseBindMatricesByNode[identifier] {
+                inverseBindMatrix = provided
+            } else {
+                inverseBindMatrix = simd_inverse(worldTransform(for: node))
+            }
+            inverseBindMatrices.append(inverseBindMatrix)
             restPoseTransforms.append(Transform(matrix: node.matrix))
             return index
         }
@@ -910,7 +936,6 @@ public class GLTFRealityKitLoader {
         context.jointIndexRemapsBySkeletonID[skeletonName] = jointIndexRemap
         jointNamesBySkeletonID[skeletonName] = jointNames
         restPoseTransformsBySkeletonID[skeletonName] = restPoseTransforms
-        ancestorChainsBySkeletonID[skeletonName] = Dictionary(uniqueKeysWithValues: jointNames.map { ($0, []) })
         #endif
 
         return skeleton
@@ -1287,7 +1312,6 @@ public class GLTFRealityKitLoader {
             var sampleInterval: Float = 1 / 30.0
         }
         var jointAnimation = AnimatedJointData()
-        var transformSamplersByNodeID = [ObjectIdentifier: GLTFTransformSampler]()
         var animations = [AnimationDefinition]()
         for (_, channels) in groupedChannels {
             guard let targetNode = channels.first?.target.node else {
@@ -1316,7 +1340,6 @@ public class GLTFRealityKitLoader {
                                                         rotationChannel: rotationChannel,
                                                         scaleChannel: scaleChannel,
                                                         maximumSampleInterval: 1 / 30.0) // TODO: Make sample interval an option
-            transformSamplersByNodeID[ObjectIdentifier(targetNode)] = transformSampler
 
             let transformFrames = stride(from: transformSampler.startTime,
                                          through: transformSampler.endTime,
@@ -1380,35 +1403,19 @@ public class GLTFRealityKitLoader {
                     continue
                 }
 
-                let ancestorChains = ancestorChainsBySkeletonID[skeletonID] ?? [:]
                 let restTransforms = restPoseTransformsBySkeletonID[skeletonID] ?? []
-                let jointIndexByName = Dictionary(uniqueKeysWithValues: orderedJointNames.enumerated().map { ($1, $0) })
 
                 let jointFrames = (0..<sampleCount).map { sampleIndex -> JointTransforms in
-                    let transforms = orderedJointNames.map { jointName -> Transform in
-                        let baseTransform: Transform
+                    let transforms = orderedJointNames.enumerated().map { jointIndex, jointName -> Transform in
+                        // RealityKit consumes joint transforms in skeleton (local)
+                        // space; fall back to the rest pose when a joint lacks keyframes.
                         if let samples = sampledTransformsByJointName[jointName], sampleIndex < samples.count {
-                            baseTransform = samples[sampleIndex]
-                        } else if let index = jointIndexByName[jointName], restTransforms.indices.contains(index) {
-                            baseTransform = restTransforms[index]
-                        } else {
-                            baseTransform = Transform()
+                            return samples[sampleIndex]
                         }
-
-                        var matrix = baseTransform.matrix
-                        if let ancestors = ancestorChains[jointName] {
-                            for ancestor in ancestors.reversed() {
-                                let ancestorMatrix: simd_float4x4
-                                if let sampler = transformSamplersByNodeID[ObjectIdentifier(ancestor)] {
-                                    ancestorMatrix = sampler.transform(at: sampleTimes[sampleIndex]).matrix
-                                } else {
-                                    ancestorMatrix = ancestor.matrix
-                                }
-                                matrix = ancestorMatrix * matrix
-                            }
+                        if restTransforms.indices.contains(jointIndex) {
+                            return restTransforms[jointIndex]
                         }
-
-                        return Transform(matrix: matrix)
+                        return Transform()
                     }
                     return JointTransforms(transforms)
                 }
