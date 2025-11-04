@@ -2408,30 +2408,31 @@ extension GLTFRealityKitLoader {
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 @MainActor
 public extension GLTFRealityKitLoader {
-
     static func convertRootAsset(asset: GLTFAsset) throws -> Entity {
-        
         let instance = GLTFRealityKitLoader()
         let rootEntity = Entity()
         rootEntity.name = "GLTF_Scene_Root"
-        
+
         let context = GLTFRealityKitResourceContext()
 
         var materials = [UUID: RealityKit.Material]()
         for gltfMaterial in asset.materials {
             if let mat = try? instance.convert(material: gltfMaterial,
-                                      context: context)
+                                               context: context)
             {
                 materials.updateValue(mat, forKey: gltfMaterial.identifier)
             }
         }
 
-        var models = [UUID: MeshResource.Model]()
-        for gltfMesh in asset.meshes {
-            if let mesh = try? instance.convertModel(mesh: gltfMesh, context: context) {
-                models.updateValue(mesh, forKey: gltfMesh.identifier)
-            }
-        }
+//        var models = [UUID: MeshResource.Model]()
+//        for gltfMesh in asset.meshes {
+//            if let mesh = try? instance.convertModel(
+//                mesh: gltfMesh,
+//                context: context
+//            ) {
+//                models.updateValue(mesh, forKey: gltfMesh.identifier)
+//            }
+//        }
 
         // TODO: Cameras
 
@@ -2470,7 +2471,7 @@ public extension GLTFRealityKitLoader {
         for gltfNode in asset.nodes {
             guard let node = nodesForIdentifier[gltfNode.identifier]
             else { continue }
-            
+
             print(node.name)
             if node.name == "Eyes" {
                 print("EYES")
@@ -2489,7 +2490,7 @@ public extension GLTFRealityKitLoader {
                     context: context
                 ) {
                     skeleton = meshSkeleton
-                    
+
 //                    for joint in skin.joints {
 //                        if let jointNode = nodesForIdentifier.values.first(where: { node in
 //                            node.name == joint.name
@@ -2500,26 +2501,29 @@ public extension GLTFRealityKitLoader {
 //                    }
                 }
             }
-            
-            
-            let g = ModelComponent(mesh: .generateSphere(radius: 0.01), materials: [])
+
+            let g = ModelComponent(
+                mesh: .generateSphere(radius: 0.01),
+                materials: []
+            )
             node.components.set(g)
-            
+
             if let gltfMesh = gltfNode.mesh {
-                if let modelComponent = try instance.convert(mesh: gltfMesh, skeleton: skeleton, context: context) {
-                    
-                    
+                if let modelComponent = try instance.convert(
+                    mesh: gltfMesh,
+                    skeleton: skeleton,
+                    context: context
+                ) {
 //                    if node.name == "Eyes" {
 //                        print("EYES")
 //                        let g = ModelComponent(mesh: .generateSphere(radius: 0.05), materials: [])
 //                        node.components.set(g)
 //                    }
 //                    else {
-                        node.components.set(modelComponent)
-                   //}
+                    node.components.set(modelComponent)
+                    // }
                 }
-                
-                
+
 //                if let model = models[gltfMesh.identifier] {
 //                    var meshContents = MeshResource.Contents()
 //                    meshContents.models = MeshModelCollection([model])
@@ -2529,7 +2533,7 @@ public extension GLTFRealityKitLoader {
 //                            .skeletons =
 //                            MeshSkeletonCollection([skeleton])
 //                    }
-//                    
+//
 //                    let meshResource = try MeshResource
 //                        .generate(from: meshContents)
 //                    let modelComponent = ModelComponent(
@@ -2537,18 +2541,21 @@ public extension GLTFRealityKitLoader {
 //                        materials: materials
 //                    )
 //                }
-
-               
             }
         }
-        
+
         // add root nodes to entity
         for node in nodesForIdentifier.values {
             if node.parent == nil {
                 rootEntity.addChild(node)
             }
         }
-        
+
+        for animation in asset.animations {
+            let rkAnimation = try? instance.convert(animation: animation)
+            rkAnimation?.store(in: rootEntity)
+        }
+
         return rootEntity
     }
 }
