@@ -1990,7 +1990,19 @@
                         var samples = [Transform]()
                         samples.reserveCapacity(sampleCount)
                         for t in sampleTimes {
-                            samples.append(transformSampler.transform(at: t))
+                            var jointTransform = transformSampler
+                                .transform(at: t)
+                            if let ancestorTransform =
+                                skeletonTransformsByJointName[
+                                    jointName
+                                ]
+                            {
+                                jointTransform =
+                                    Transform(matrix: ancestorTransform
+                                        .matrix * jointTransform
+                                        .matrix)
+                            }
+                            samples.append(jointTransform)
                         }
                         sampledTransformsByJointName[jointName] = samples
                     }
@@ -2491,14 +2503,32 @@ public extension GLTFRealityKitLoader {
                 ) {
                     skeleton = meshSkeleton
 
-//                    for joint in skin.joints {
-//                        if let jointNode = nodesForIdentifier.values.first(where: { node in
-//                            node.name == joint.name
-//                        } ){
-//                            let m = jointNode.transform.matrix * simd_inverse(joint.matrix)
-//                            jointNode.transform = Transform(matrix: joint.matrix)
-//                        }
-//                    }
+                    // Cache some associations between joints, entities, and skeletons so we can look them up later.
+                    instance.pathsForSkeletonIDs[meshSkeleton.id] = gltfNode
+                        .bindPath
+                    for joint in meshSkeleton.joints {
+                        if joint.parentIndex == nil,
+                           let referenceNode = skin.skeleton
+                        {
+                            // TODO: Calculate the total transformation between the joint and the skeleton node?
+                            instance.skeletonTransformsByJointName[
+                                joint
+                                    .name
+                            ] =
+                                Transform(matrix: referenceNode
+                                    .matrix)
+                        }
+                        if let existingJointCache =
+                            instance.skeletonIDsByJointName[joint.name]
+                        {
+                            instance.skeletonIDsByJointName[joint.name] =
+                                existingJointCache +
+                                [meshSkeleton.id]
+                        } else {
+                            instance.skeletonIDsByJointName[joint.name] =
+                                [meshSkeleton.id]
+                        }
+                    }
                 }
             }
 
