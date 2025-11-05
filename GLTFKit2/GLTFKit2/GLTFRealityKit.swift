@@ -839,6 +839,19 @@
             ] =
                 [:]
             private var skeletonTransformsByJointName: [String: Transform] = [:]
+
+            private func absoluteTransform(for node: GLTFNode)
+                -> simd_float4x4
+            {
+                var transform = node.matrix
+                var current = node.parent
+                while let parent = current {
+                    transform = parent.matrix * transform
+                    current = parent.parent
+                }
+                return transform
+            }
+
             #if compiler(>=6.0) || os(visionOS)
                 private var jointNamesBySkeletonID: [String: [String]] = [:]
                 private var restPoseTransformsBySkeletonID: [
