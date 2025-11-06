@@ -2440,22 +2440,13 @@ public extension GLTFRealityKitLoader {
 
         let context = GLTFRealityKitResourceContext()
 
-        var materials = [UUID: RealityKit.Material]()
-        for gltfMaterial in asset.materials {
-            if let mat = try? instance.convert(material: gltfMaterial,
-                                               context: context)
-            {
-                materials.updateValue(mat, forKey: gltfMaterial.identifier)
-            }
-        }
-
-//        var models = [UUID: MeshResource.Model]()
-//        for gltfMesh in asset.meshes {
-//            if let mesh = try? instance.convertModel(
-//                mesh: gltfMesh,
-//                context: context
-//            ) {
-//                models.updateValue(mesh, forKey: gltfMesh.identifier)
+//        // Unused
+//        var materials = [UUID: RealityKit.Material]()
+//        for gltfMaterial in asset.materials {
+//            if let mat = try? instance.convert(material: gltfMaterial,
+//                                               context: context)
+//            {
+//                materials.updateValue(mat, forKey: gltfMaterial.identifier)
 //            }
 //        }
 
@@ -2501,10 +2492,6 @@ public extension GLTFRealityKitLoader {
             guard let node = nodesForIdentifier[gltfNode.identifier]
             else { continue }
 
-            print(node.name)
-            if node.name == "Eyes" {
-                print("EYES")
-            }
             // TODO: cameras
             if let _ = gltfNode.camera {}
 
@@ -2548,12 +2535,13 @@ public extension GLTFRealityKitLoader {
                     }
                 }
             }
-
-            let g = ModelComponent(
-                mesh: .generateSphere(radius: 0.01),
-                materials: []
-            )
-            node.components.set(g)
+            
+//            // DEBUG Nodes
+//            let g = ModelComponent(
+//                mesh: .generateSphere(radius: 0.01),
+//                materials: []
+//            )
+//            node.components.set(g)
 
             if let gltfMesh = gltfNode.mesh {
                 if let modelComponent = try instance.convert(
@@ -2561,14 +2549,7 @@ public extension GLTFRealityKitLoader {
                     skeleton: skeleton,
                     context: context
                 ) {
-//                    if node.name == "Eyes" {
-//                        print("EYES")
-//                        let g = ModelComponent(mesh: .generateSphere(radius: 0.05), materials: [])
-//                        node.components.set(g)
-//                    }
-//                    else {
                     node.components.set(modelComponent)
-                    // }
 
                     let meshIdentifier = ObjectIdentifier(gltfMesh)
                     if var blendShapeInfo =
@@ -2587,7 +2568,7 @@ public extension GLTFRealityKitLoader {
                             // begins and cache the ordering RealityKit assigned to
                             // each weight set.
                             let defaultWeights =
-                            instance.defaultBlendShapeWeights(for: gltfNode)
+                                instance.defaultBlendShapeWeights(for: gltfNode)
                             var weightsByName = [String: Float]()
                             for (index, name) in blendShapeInfo
                                 .weightNames
@@ -2636,24 +2617,6 @@ public extension GLTFRealityKitLoader {
                         }
                     }
                 }
-
-//                if let model = models[gltfMesh.identifier] {
-//                    var meshContents = MeshResource.Contents()
-//                    meshContents.models = MeshModelCollection([model])
-//
-//                    if let skeleton {
-//                        meshContents
-//                            .skeletons =
-//                            MeshSkeletonCollection([skeleton])
-//                    }
-//
-//                    let meshResource = try MeshResource
-//                        .generate(from: meshContents)
-//                    let modelComponent = ModelComponent(
-//                        mesh: meshResource,
-//                        materials: materials
-//                    )
-//                }
             }
         }
 
