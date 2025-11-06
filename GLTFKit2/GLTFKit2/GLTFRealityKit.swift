@@ -951,6 +951,75 @@
 
                 return rootEntity
             }
+            
+            @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+            @MainActor func convertBlendshape(gltfNode: GLTFNode, gltfMesh: GLTFMesh, nodeEntity: Entity, meshComponent: ModelComponent) {
+                let meshIdentifier = ObjectIdentifier(gltfMesh)
+                if var blendShapeInfo =
+                    blendShapeInfo(for: meshIdentifier),
+                    !blendShapeInfo.weightNames.isEmpty
+                {
+                    var blendShapeComponent =
+                        BlendShapeWeightsComponent(
+                            weightsMapping: BlendShapeWeightsMapping(meshResource: meshComponent
+                                .mesh)
+                        )
+                    var weightSet = blendShapeComponent.weightSet
+                    if !weightSet.isEmpty {
+                        // Seed the component with the glTF default weights so the
+                        // entity matches the authoring pose before animation
+                        // begins and cache the ordering RealityKit assigned to
+                        // each weight set.
+                        let defaultWeights =
+                            defaultBlendShapeWeights(for: gltfNode)
+                        var weightsByName = [String: Float]()
+                        for (index, name) in blendShapeInfo
+                            .weightNames
+                            .enumerated()
+                        {
+                            if index < defaultWeights.count {
+                                weightsByName[name] =
+                                    defaultWeights[index]
+                            } else {
+                                weightsByName[name] = 0.0
+                            }
+                        }
+
+                        var setInfos =
+                            [BlendShapeWeightsData.ID: [String]]()
+                        for data in weightSet {
+                            let names = data.weightNames
+                            let values = names
+                                .map { weightsByName[$0] ?? 0.0 }
+                            var updated = data
+                            updated
+                                .weights = BlendShapeWeights(values)
+                            weightSet.set(updated)
+                            setInfos[updated.id] = names
+                        }
+
+                        if var defaultEntry = weightSet.default {
+                            let defaultValues = defaultEntry
+                                .weightNames
+                                .map { weightsByName[$0] ?? 0.0 }
+                            defaultEntry
+                                .weights =
+                                BlendShapeWeights(defaultValues)
+                            weightSet.default = defaultEntry
+                        }
+
+                        blendShapeComponent.weightSet = weightSet
+                        nodeEntity.components
+                            .set(blendShapeComponent)
+
+                        blendShapeInfo.setInfos = setInfos
+                        setBlendShapeInfo(
+                            blendShapeInfo,
+                            for: meshIdentifier
+                        )
+                    }
+                }
+            }
 
             @MainActor func convert(
                 node gltfNode: GLTFNode,
@@ -1016,71 +1085,7 @@
 
                     #if compiler(>=6.0) || os(visionOS)
                         if #available(macOS 15.0, iOS 18.0, visionOS 2.0, *) {
-                            let meshIdentifier = ObjectIdentifier(gltfMesh)
-                            if var blendShapeInfo =
-                                blendShapeInfo(for: meshIdentifier),
-                                !blendShapeInfo.weightNames.isEmpty
-                            {
-                                var blendShapeComponent =
-                                    BlendShapeWeightsComponent(
-                                        weightsMapping: BlendShapeWeightsMapping(meshResource: meshComponent
-                                            .mesh)
-                                    )
-                                var weightSet = blendShapeComponent.weightSet
-                                if !weightSet.isEmpty {
-                                    // Seed the component with the glTF default weights so the
-                                    // entity matches the authoring pose before animation
-                                    // begins and cache the ordering RealityKit assigned to
-                                    // each weight set.
-                                    let defaultWeights =
-                                        defaultBlendShapeWeights(for: gltfNode)
-                                    var weightsByName = [String: Float]()
-                                    for (index, name) in blendShapeInfo
-                                        .weightNames
-                                        .enumerated()
-                                    {
-                                        if index < defaultWeights.count {
-                                            weightsByName[name] =
-                                                defaultWeights[index]
-                                        } else {
-                                            weightsByName[name] = 0.0
-                                        }
-                                    }
-
-                                    var setInfos =
-                                        [BlendShapeWeightsData.ID: [String]]()
-                                    for data in weightSet {
-                                        let names = data.weightNames
-                                        let values = names
-                                            .map { weightsByName[$0] ?? 0.0 }
-                                        var updated = data
-                                        updated
-                                            .weights = BlendShapeWeights(values)
-                                        weightSet.set(updated)
-                                        setInfos[updated.id] = names
-                                    }
-
-                                    if var defaultEntry = weightSet.default {
-                                        let defaultValues = defaultEntry
-                                            .weightNames
-                                            .map { weightsByName[$0] ?? 0.0 }
-                                        defaultEntry
-                                            .weights =
-                                            BlendShapeWeights(defaultValues)
-                                        weightSet.default = defaultEntry
-                                    }
-
-                                    blendShapeComponent.weightSet = weightSet
-                                    nodeEntity.components
-                                        .set(blendShapeComponent)
-
-                                    blendShapeInfo.setInfos = setInfos
-                                    setBlendShapeInfo(
-                                        blendShapeInfo,
-                                        for: meshIdentifier
-                                    )
-                                }
-                            }
+                            convertBlendshape(gltfNode: gltfNode, gltfMesh: gltfMesh, nodeEntity: nodeEntity, meshComponent: meshComponent)
                         }
                     #endif
                 }
@@ -2550,72 +2555,8 @@ public extension GLTFRealityKitLoader {
                     context: context
                 ) {
                     node.components.set(modelComponent)
-
-                    let meshIdentifier = ObjectIdentifier(gltfMesh)
-                    if var blendShapeInfo =
-                        instance.blendShapeInfo(for: meshIdentifier),
-                        !blendShapeInfo.weightNames.isEmpty
-                    {
-                        var blendShapeComponent =
-                            BlendShapeWeightsComponent(
-                                weightsMapping: BlendShapeWeightsMapping(meshResource: modelComponent
-                                    .mesh)
-                            )
-                        var weightSet = blendShapeComponent.weightSet
-                        if !weightSet.isEmpty {
-                            // Seed the component with the glTF default weights so the
-                            // entity matches the authoring pose before animation
-                            // begins and cache the ordering RealityKit assigned to
-                            // each weight set.
-                            let defaultWeights =
-                                instance.defaultBlendShapeWeights(for: gltfNode)
-                            var weightsByName = [String: Float]()
-                            for (index, name) in blendShapeInfo
-                                .weightNames
-                                .enumerated()
-                            {
-                                if index < defaultWeights.count {
-                                    weightsByName[name] =
-                                        defaultWeights[index]
-                                } else {
-                                    weightsByName[name] = 0.0
-                                }
-                            }
-
-                            var setInfos =
-                                [BlendShapeWeightsData.ID: [String]]()
-                            for data in weightSet {
-                                let names = data.weightNames
-                                let values = names
-                                    .map { weightsByName[$0] ?? 0.0 }
-                                var updated = data
-                                updated
-                                    .weights = BlendShapeWeights(values)
-                                weightSet.set(updated)
-                                setInfos[updated.id] = names
-                            }
-
-                            if var defaultEntry = weightSet.default {
-                                let defaultValues = defaultEntry
-                                    .weightNames
-                                    .map { weightsByName[$0] ?? 0.0 }
-                                defaultEntry
-                                    .weights =
-                                    BlendShapeWeights(defaultValues)
-                                weightSet.default = defaultEntry
-                            }
-
-                            blendShapeComponent.weightSet = weightSet
-                            node.components
-                                .set(blendShapeComponent)
-
-                            blendShapeInfo.setInfos = setInfos
-                            instance.setBlendShapeInfo(
-                                blendShapeInfo,
-                                for: meshIdentifier
-                            )
-                        }
-                    }
+                    
+                    instance.convertBlendshape(gltfNode: gltfNode, gltfMesh: gltfMesh, nodeEntity: node, meshComponent: modelComponent)
                 }
             }
         }
