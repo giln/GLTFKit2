@@ -2,7 +2,21 @@
 
     import Accelerate
     import ModelIO
-    import RealityKit
+import RealityKit
+
+@available(macOS 12.0, iOS 15.0, visionOS 1.0, *)
+public struct GLTFMaterialBindingsComponent: Component {
+    public struct Binding {
+        public let partID: String
+        public let primitive: GLTFPrimitive
+    }
+
+    public var bindings: [String: Binding]
+
+    public init(bindings: [String: Binding]) {
+        self.bindings = bindings
+    }
+}
 
     #if os(macOS)
         typealias PlatformColor = NSColor
@@ -822,7 +836,7 @@
         }
 
         @available(macOS 12.0, iOS 15.0, *)
-        public class GLTFRealityKitLoader {
+    public class GLTFRealityKitLoader {
             #if os(macOS)
                 let colorSpace =
                     NSColorSpace(cgColorSpace: CGColorSpace(name: CGColorSpace
@@ -1075,13 +1089,18 @@
                 #endif
 
                 if let gltfMesh = gltfNode.mesh,
-                   let meshComponent = try convert(
+                   let (meshComponent, materialBindings) = try convert(
                        mesh: gltfMesh,
                        skeleton: skeleton,
                        context: context
                    )
                 {
                     nodeEntity.components.set(meshComponent)
+
+                    if !materialBindings.isEmpty {
+                        nodeEntity.components
+                            .set(GLTFMaterialBindingsComponent(bindings: materialBindings))
+                    }
 
                     #if compiler(>=6.0) || os(visionOS)
                         if #available(macOS 15.0, iOS 18.0, visionOS 2.0, *) {
@@ -1339,7 +1358,7 @@
                 mesh gltfMesh: GLTFMesh,
                 skeleton: Any? /* MeshResource.Skeleton? */ = nil,
                 context: GLTFRealityKitResourceContext
-            ) throws -> RealityKit.ModelComponent? {
+            ) throws -> (RealityKit.ModelComponent, [String: GLTFMaterialBindingsComponent.Binding])? {
                 var skeletonID: String?
                 #if compiler(>=6.0) || os(visionOS)
                     if #available(macOS 15.0, iOS 18.0, *) {
@@ -1390,7 +1409,8 @@
                 typealias PrimitiveConversion = (
                     part: MeshResource.Part,
                     material: any RealityKit.Material,
-                    hasBlendShapes: Bool
+                    hasBlendShapes: Bool,
+                    primitive: GLTFPrimitive
                 )
                 var primitiveMaterialIndex: Int = 0
                 let primitiveConversions = try gltfMesh.primitives
@@ -1410,8 +1430,8 @@
                             context: context
                         )
                         primitiveMaterialIndex += 1
-                        return (part, material, hasBlendShapes)
-                    }
+                        return (part, material, hasBlendShapes, primitive)
+                }
 
                 if primitiveConversions.isEmpty {
                     // If we weren't able to successfully build any parts for our primitives, don't bother generating a mesh.
@@ -1463,7 +1483,16 @@
                     materials: materials
                 )
 
-                return modelComponent
+                var materialBindings: [String: GLTFMaterialBindingsComponent.Binding] = [:]
+                for conversion in primitiveConversions {
+                    let binding = GLTFMaterialBindingsComponent.Binding(
+                        partID: conversion.part.id,
+                        primitive: conversion.primitive
+                    )
+                    materialBindings[conversion.part.id] = binding
+                }
+
+                return (modelComponent, materialBindings)
             }
 
             func convert(
@@ -2375,7 +2404,8 @@ extension GLTFRealityKitLoader {
         typealias PrimitiveConversion = (
             part: MeshResource.Part,
             material: any RealityKit.Material,
-            hasBlendShapes: Bool
+            hasBlendShapes: Bool,
+            primitive: GLTFPrimitive
         )
         var primitiveMaterialIndex: Int = 0
         let primitiveConversions = try gltfMesh.primitives
@@ -2395,7 +2425,7 @@ extension GLTFRealityKitLoader {
                     context: context
                 )
                 primitiveMaterialIndex += 1
-                return (part, material, hasBlendShapes)
+                return (part, material, hasBlendShapes, primitive)
             }
 
         if primitiveConversions.isEmpty {
@@ -2549,7 +2579,7 @@ public extension GLTFRealityKitLoader {
 //            node.components.set(g)
 
             if let gltfMesh = gltfNode.mesh {
-                if let modelComponent = try instance.convert(
+                if let (modelComponent, materialBindings) = try instance.convert(
                     mesh: gltfMesh,
                     skeleton: skeleton,
                     context: context
@@ -2557,6 +2587,11 @@ public extension GLTFRealityKitLoader {
                     node.components.set(modelComponent)
                     
                     instance.convertBlendshape(gltfNode: gltfNode, gltfMesh: gltfMesh, nodeEntity: node, meshComponent: modelComponent)
+
+                    if !materialBindings.isEmpty {
+                        node.components
+                            .set(GLTFMaterialBindingsComponent(bindings: materialBindings))
+                    }
                 }
             }
         }
