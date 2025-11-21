@@ -872,6 +872,12 @@ public struct GLTFMaterialBindingsComponent: Component {
                     String: [Transform]
                 ] =
                     [:]
+                private var mergedSkeletonPlanStorage: Any?
+                @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+                private var mergedSkeletonPlan: MergedSkeletonPlan? {
+                    get { mergedSkeletonPlanStorage as? MergedSkeletonPlan }
+                    set { mergedSkeletonPlanStorage = newValue }
+                }
                 /// RealityKit only exposes blend-shape bindings via generated identifiers,
                 /// so we memoise per-mesh metadata here to rehydrate weight sets when
                 /// meshes are instanced in the entity graph.
@@ -896,6 +902,25 @@ public struct GLTFMaterialBindingsComponent: Component {
                     } else {
                         blendShapeInfoStorage.removeValue(forKey: identifier)
                     }
+                }
+
+                @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+                private struct SkeletonBuildResult {
+                    let skeletonName: String
+                    let jointNames: [String]
+                    let parentIndices: [Int?]
+                    let inverseBindPoseMatrices: [simd_float4x4]
+                    let restPoseTransforms: [Transform]
+                    let jointIndexRemap: [UInt16]
+                }
+
+                @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+                private struct MergedSkeletonPlan {
+                    let skeleton: MeshResource.Skeleton
+                    let remapBySkin: [ObjectIdentifier: [UInt16]]
+                    let restPoseTransforms: [Transform]
+                    let jointNames: [String]
+                    let skeletonRootTransforms: [String: Transform]
                 }
             #endif
 
@@ -937,6 +962,16 @@ public struct GLTFMaterialBindingsComponent: Component {
                 asset: GLTFAsset? = nil
             ) -> RealityKit.Entity {
                 let context = GLTFRealityKitResourceContext()
+
+                #if compiler(>=6.0) || os(visionOS)
+                    if #available(macOS 15.0, iOS 18.0, visionOS 2.0, *),
+                       mergedSkeletonPlan == nil
+                    {
+                        mergedSkeletonPlan = prepareMergedSkeletonPlan(
+                            asset: asset
+                        )
+                    }
+                #endif
 
                 let rootEntity = Entity()
                 rootEntity.name = "glTF_\(scene.name ?? "Scene")_Root"
@@ -1040,6 +1075,7 @@ public struct GLTFMaterialBindingsComponent: Component {
                 context: GLTFRealityKitResourceContext
             ) throws -> RealityKit.Entity {
                 let nodeEntity = ModelEntity()
+                var skinIdentifier: ObjectIdentifier?
 
                 // TODO: This only ensures uniqueness for unnamed nodes; the asset could still contain duplicate names.
                 nodeEntity.name = gltfNode.name ?? nameGenerator
@@ -1051,7 +1087,42 @@ public struct GLTFMaterialBindingsComponent: Component {
                 #if compiler(>=6.0)
                     if #available(macOS 15.0, iOS 18.0, visionOS 2.0, *) {
                         if let skin = gltfNode.skin {
-                            if let meshSkeleton = convert(
+                            skinIdentifier = ObjectIdentifier(skin)
+                            if let plan = mergedSkeletonPlan,
+                               let remap = plan.remapBySkin[skinIdentifier!]
+                            {
+                                skeleton = plan.skeleton
+                                if pathsForSkeletonIDs[plan.skeleton.id] == nil {
+                                    pathsForSkeletonIDs[plan.skeleton.id] =
+                                        gltfNode.bindPath
+                                }
+                                for (jointName, transform) in plan
+                                    .skeletonRootTransforms
+                                {
+                                    skeletonTransformsByJointName[jointName] =
+                                        transform
+                                }
+                                for jointName in plan.jointNames {
+                                    if let existing = skeletonIDsByJointName[
+                                        jointName
+                                    ] {
+                                        if !existing
+                                            .contains(plan.skeleton.id)
+                                        {
+                                            skeletonIDsByJointName[jointName] =
+                                                existing +
+                                                [plan.skeleton.id]
+                                        }
+                                    } else {
+                                        skeletonIDsByJointName[jointName] = [
+                                            plan.skeleton.id,
+                                        ]
+                                    }
+                                }
+                                context.jointIndexRemapsBySkeletonID[
+                                    plan.skeleton.id
+                                ] = remap
+                            } else if let meshSkeleton = convert(
                                 skin: skin,
                                 bindingNode: gltfNode,
                                 context: context
@@ -1092,6 +1163,7 @@ public struct GLTFMaterialBindingsComponent: Component {
                    let (meshComponent, materialBindings) = try convert(
                        mesh: gltfMesh,
                        skeleton: skeleton,
+                       skinIdentifier: skinIdentifier,
                        context: context
                    )
                 {
@@ -1155,27 +1227,16 @@ public struct GLTFMaterialBindingsComponent: Component {
                     }
                     return []
                 }
-            #endif
 
-            #if compiler(>=6.0) || os(visionOS)
                 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
-                func convert(
-                    skin gltfSkin: GLTFSkin,
-                    bindingNode _: GLTFNode,
-                    context: GLTFRealityKitResourceContext
-                ) -> MeshResource.Skeleton? {
+                private func buildSkeletonData(for gltfSkin: GLTFSkin)
+                    -> SkeletonBuildResult?
+                {
                     let skeletonName = gltfSkin.name ?? nameGenerator
                         .nextUniqueName(prefix: "Skin")
                     let joints = gltfSkin.joints
 
-                    guard !joints.isEmpty else {
-                        #if DEBUG
-                            print(
-                                "[GLTFKit2] Skipping skeleton generation for skin \(skeletonName) with no joints"
-                            )
-                        #endif
-                        return nil
-                    }
+                    guard !joints.isEmpty else { return nil }
 
                     if joints.count > Int(UInt16.max) {
                         #if DEBUG
@@ -1186,32 +1247,11 @@ public struct GLTFMaterialBindingsComponent: Component {
                         return nil
                     }
 
-                    var worldTransformCache =
-                        [ObjectIdentifier: simd_float4x4]()
-                    func worldTransform(for node: GLTFNode) -> simd_float4x4 {
-                        let identifier = ObjectIdentifier(node)
-                        if let cached = worldTransformCache[identifier] {
-                            return cached
-                        }
-                        let transform: simd_float4x4
-                        if let parent = node.parent {
-                            transform = worldTransform(for: parent) * node
-                                .matrix
-                        } else {
-                            transform = node.matrix
-                        }
-                        worldTransformCache[identifier] = transform
-                        return transform
-                    }
-
                     var providedInverseBindMatricesByNode =
                         [ObjectIdentifier: simd_float4x4]()
                     if let accessor = gltfSkin.inverseBindMatrices,
                        let matrices = packedFloat4x4(for: accessor)
                     {
-                        // Honour author-supplied inverse bind matrices when available so we
-                        // don't lose non-trivial skeleton offsets (common in rigs that bind
-                        // meshes in local pose space).
                         if matrices.count < joints.count {
                             #if DEBUG
                                 print(
@@ -1273,7 +1313,7 @@ public struct GLTFMaterialBindingsComponent: Component {
                             inverseBindMatrix = provided
                         } else {
                             inverseBindMatrix =
-                                simd_inverse(worldTransform(for: node))
+                                simd_inverse(absoluteTransform(for: node))
                         }
                         inverseBindMatrices.append(inverseBindMatrix)
                         restPoseTransforms
@@ -1336,18 +1376,139 @@ public struct GLTFMaterialBindingsComponent: Component {
                         return nil
                     }
 
-                    let skeleton = MeshResource.Skeleton(id: skeletonName,
-                                                         jointNames: jointNames,
-                                                         inverseBindPoseMatrices: inverseBindMatrices,
-                                                         parentIndices: parentIndices)
+                    return SkeletonBuildResult(
+                        skeletonName: skeletonName,
+                        jointNames: jointNames,
+                        parentIndices: parentIndices,
+                        inverseBindPoseMatrices: inverseBindMatrices,
+                        restPoseTransforms: restPoseTransforms,
+                        jointIndexRemap: jointIndexRemap
+                    )
+                }
+
+                @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+                private func prepareMergedSkeletonPlan(asset: GLTFAsset?)
+                    -> MergedSkeletonPlan?
+                {
+                    guard let skins = asset?.skins,
+                          skins.count > 1 else { return nil }
+
+                    var mergedJointNames: [String] = []
+                    var mergedParentIndices: [Int?] = []
+                    var mergedInverseBindMatrices: [simd_float4x4] = []
+                    var mergedRestPoseTransforms: [Transform] = []
+                    var remapBySkin: [ObjectIdentifier: [UInt16]] = [:]
+                    var rootTransforms: [String: Transform] = [:]
+
+                    for skin in skins {
+                        guard let data = buildSkeletonData(for: skin) else {
+                            continue
+                        }
+                        let offset = mergedJointNames.count
+
+                        let adjustedParents = data.parentIndices.map { parent
+                            -> Int? in
+                            if let parent {
+                                return parent + offset
+                            }
+                            return nil
+                        }
+                        mergedJointNames.append(contentsOf: data.jointNames)
+                        mergedParentIndices
+                            .append(contentsOf: adjustedParents)
+                        mergedInverseBindMatrices.append(contentsOf: data
+                            .inverseBindPoseMatrices)
+                        mergedRestPoseTransforms
+                            .append(contentsOf: data.restPoseTransforms)
+
+                        let remapped = data.jointIndexRemap.map { index in
+                            UInt16(Int(index) + offset)
+                        }
+                        remapBySkin[ObjectIdentifier(skin)] = remapped
+
+                        if let referenceNode = skin.skeleton {
+                            let transform = Transform(matrix: referenceNode
+                                .matrix)
+                            for (jointName, parent) in zip(data.jointNames,
+                                                           data.parentIndices)
+                            where parent == nil {
+                                rootTransforms[jointName] = transform
+                            }
+                        }
+                    }
+
+                    guard !remapBySkin.isEmpty else { return nil }
+
+                    if mergedJointNames.count > Int(UInt16.max) {
+                        #if DEBUG
+                            print(
+                                "[GLTFKit2] Merged skeleton exceeds supported joint count (\(mergedJointNames.count) > 65535)"
+                            )
+                        #endif
+                        return nil
+                    }
+
+                    let mergedID = skins.first?.name ??
+                        nameGenerator.nextUniqueName(prefix: "Skeleton")
+                    guard let skeleton = MeshResource.Skeleton(
+                        id: mergedID,
+                        jointNames: mergedJointNames,
+                        inverseBindPoseMatrices: mergedInverseBindMatrices,
+                        parentIndices: mergedParentIndices
+                    ) else { return nil }
+
+                    jointNamesBySkeletonID[mergedID] = mergedJointNames
+                    restPoseTransformsBySkeletonID[mergedID] =
+                        mergedRestPoseTransforms
+                    for jointName in mergedJointNames {
+                        if var existing = skeletonIDsByJointName[jointName] {
+                            if !existing.contains(mergedID) {
+                                existing.append(mergedID)
+                            }
+                            skeletonIDsByJointName[jointName] = existing
+                        } else {
+                            skeletonIDsByJointName[jointName] = [mergedID]
+                        }
+                    }
+
+                    return MergedSkeletonPlan(
+                        skeleton: skeleton,
+                        remapBySkin: remapBySkin,
+                        restPoseTransforms: mergedRestPoseTransforms,
+                        jointNames: mergedJointNames,
+                        skeletonRootTransforms: rootTransforms
+                    )
+                }
+            #endif
+
+            #if compiler(>=6.0) || os(visionOS)
+                @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
+                func convert(
+                    skin gltfSkin: GLTFSkin,
+                    bindingNode _: GLTFNode,
+                    context: GLTFRealityKitResourceContext
+                ) -> MeshResource.Skeleton? {
+                    guard let data = buildSkeletonData(for: gltfSkin) else {
+                        return nil
+                    }
+
+                    guard let skeleton = MeshResource.Skeleton(
+                        id: data.skeletonName,
+                        jointNames: data.jointNames,
+                        inverseBindPoseMatrices: data.inverseBindPoseMatrices,
+                        parentIndices: data.parentIndices
+                    ) else {
+                        return nil
+                    }
 
                     #if compiler(>=6.0) || os(visionOS)
                         context
-                            .jointIndexRemapsBySkeletonID[skeletonName] =
-                            jointIndexRemap
-                        jointNamesBySkeletonID[skeletonName] = jointNames
-                        restPoseTransformsBySkeletonID[skeletonName] =
-                            restPoseTransforms
+                            .jointIndexRemapsBySkeletonID[data.skeletonName] =
+                            data.jointIndexRemap
+                        jointNamesBySkeletonID[data.skeletonName] =
+                            data.jointNames
+                        restPoseTransformsBySkeletonID[data.skeletonName] =
+                            data.restPoseTransforms
                     #endif
 
                     return skeleton
@@ -1357,6 +1518,7 @@ public struct GLTFMaterialBindingsComponent: Component {
             @MainActor func convert(
                 mesh gltfMesh: GLTFMesh,
                 skeleton: Any? /* MeshResource.Skeleton? */ = nil,
+                skinIdentifier: ObjectIdentifier? = nil,
                 context: GLTFRealityKitResourceContext
             ) throws -> (RealityKit.ModelComponent, [String: GLTFMaterialBindingsComponent.Binding])? {
                 var skeletonID: String?
@@ -1366,6 +1528,29 @@ public struct GLTFMaterialBindingsComponent: Component {
                             skeletonID = skeleton.id
                         }
                     }
+                #endif
+
+                let jointIndexRemapForSkin: [UInt16]?
+                #if compiler(>=6.0) || os(visionOS)
+                    if #available(macOS 15.0, iOS 18.0, *) {
+                        if let skinIdentifier,
+                           let remap = mergedSkeletonPlan?
+                               .remapBySkin[skinIdentifier]
+                        {
+                            jointIndexRemapForSkin = remap
+                        } else if let skeletonID,
+                                  let remap = context
+                                  .jointIndexRemapsBySkeletonID[skeletonID]
+                        {
+                            jointIndexRemapForSkin = remap
+                        } else {
+                            jointIndexRemapForSkin = nil
+                        }
+                    } else {
+                        jointIndexRemapForSkin = nil
+                    }
+                #else
+                    jointIndexRemapForSkin = nil
                 #endif
 
                 var blendShapeNames: [String] = []
@@ -1420,6 +1605,7 @@ public struct GLTFMaterialBindingsComponent: Component {
                             materialIndex: primitiveMaterialIndex,
                             skeletonID: skeletonID,
                             blendShapeNames: blendShapeNames,
+                            jointIndexRemap: jointIndexRemapForSkin,
                             context: context
                         ) else {
                             return nil
@@ -1500,6 +1686,7 @@ public struct GLTFMaterialBindingsComponent: Component {
                 materialIndex: Int = 0,
                 skeletonID: String? = nil,
                 blendShapeNames: [String] = [],
+                jointIndexRemap: [UInt16]? = nil,
                 context: GLTFRealityKitResourceContext
             ) -> (MeshResource.Part, Bool)? {
                 if gltfPrimitive.primitiveType != .triangles {
@@ -1615,7 +1802,7 @@ public struct GLTFMaterialBindingsComponent: Component {
                             packedFloat4Array(for: weights0Attribute
                                 .accessor)
                         {
-                            let jointIndexRemap = skeletonID
+                            let jointIndexRemap = jointIndexRemap ?? skeletonID
                                 .flatMap {
                                     context.jointIndexRemapsBySkeletonID[$0]
                                 }
