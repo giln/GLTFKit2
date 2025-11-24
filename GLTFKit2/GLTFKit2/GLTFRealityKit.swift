@@ -843,6 +843,7 @@ public struct GLTFMaterialBindingsComponent: Component {
                             .linearSRGB)!)!
             #endif
             private let nameGenerator = UniqueNameGenerator()
+            public static var usdRawAnimationDefinitions: [String: AnimationGroup] = [:]
 
             private var pathsForSkeletonIDs: [ /* MeshResource.Skeleton.ID */
                 String: BindTarget
@@ -953,6 +954,7 @@ public struct GLTFMaterialBindingsComponent: Component {
                 scene: GLTFScene,
                 asset: GLTFAsset?
             ) -> RealityKit.Entity {
+                GLTFRealityKitLoader.usdRawAnimationDefinitions = [:]
                 let instance = GLTFRealityKitLoader()
                 return instance.convert(scene: scene, asset: asset)
             }
@@ -2301,10 +2303,53 @@ public struct GLTFMaterialBindingsComponent: Component {
                     }
                 }
 
+                if ProcessInfo.processInfo.environment["USD_DEBUG_ANIM"] == "1" {
+                    func dumpDefinition(_ definition: AnimationDefinition,
+                                        indent: String) {
+                        let typeName = String(describing: type(of: definition))
+                        if let group = definition as? AnimationGroup {
+                            print("\(indent)group \(typeName) count=\(group.group.count)")
+                            for child in group.group {
+                                dumpDefinition(child, indent: indent + "  ")
+                            }
+                            return
+                        }
+                        if let view = definition as? AnimationView,
+                           let source = view.source
+                        {
+                            print("\(indent)view \(typeName)")
+                            dumpDefinition(source, indent: indent + "  ")
+                            return
+                        }
+                        if #available(macOS 15.0, iOS 18.0, visionOS 2.0, *),
+                           let sampled = definition as? SampledAnimation<BlendShapeWeights>
+                        {
+                            print("\(indent)sampled BlendShapeWeights bind=\(sampled.bindTarget) frames=\(sampled.frames.count)")
+                            return
+                        }
+                        if let sampled = definition as? SampledAnimation<Transform> {
+                            print("\(indent)sampled Transform bind=\(sampled.bindTarget) frames=\(sampled.frames.count)")
+                            return
+                        }
+                        if let sampled = definition as? SampledAnimation<JointTransforms> {
+                            print("\(indent)sampled JointTransforms bind=\(sampled.bindTarget) frames=\(sampled.frames.count)")
+                            return
+                        }
+                        print("\(indent)definition \(typeName)")
+                    }
+
+                    print("[GLTFRealityKit] animation \(name) definitions before generate (\(animations.count))")
+                    for definition in animations {
+                        dumpDefinition(definition, indent: "  ")
+                    }
+                }
+
                 let groupAnimation = AnimationGroup(
                     group: animations,
                     name: name
                 )
+                GLTFRealityKitLoader.usdRawAnimationDefinitions[name] =
+                    groupAnimation
                 return try AnimationResource.generate(with: groupAnimation)
             }
 
@@ -2473,10 +2518,13 @@ public struct GLTFMaterialBindingsComponent: Component {
                         return []
                     }
 
+                    print("[GLTFRealityKit] convertWeightAnimations node=\(node.name ?? "<unnamed>") weights=\(info.weightNames.count) channels=\(weightChannels.count)")
+
                     let defaultWeights = defaultBlendShapeWeights(for: node)
 
                     var animations = [AnimationDefinition]()
                     for weightChannel in weightChannels {
+                        print("[GLTFRealityKit]  channel sampler input=\(weightChannel.sampler.input.name ?? "<unnamed>") output=\(weightChannel.sampler.output.name ?? "<unnamed>") target=\(weightChannel.target.path)")
                         // Each channel updates either the aggregate blend weight array or a
                         // specific weight set (for meshes with multiple materials), so we
                         // emit the appropriate SampledAnimation objects for whichever case
