@@ -2286,11 +2286,11 @@
                                         {
                                             return samples[sampleIndex]
                                         }
-//                                        if restTransforms.indices
-//                                            .contains(jointIndex)
-//                                        {
-//                                            return restTransforms[jointIndex]
-//                                        }
+                                        if restTransforms.indices
+                                            .contains(jointIndex)
+                                        {
+                                            return restTransforms[jointIndex]
+                                        }
                                         return Transform()
                                     }
                                 return JointTransforms(transforms)
