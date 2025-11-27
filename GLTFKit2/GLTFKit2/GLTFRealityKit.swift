@@ -2708,9 +2708,9 @@ public extension GLTFRealityKitLoader {
                 .nextUniqueName(prefix: "Node")
 
             // Ignore skin local transform
-            // if gltfNode.skin == nil {
-            entity.transform = Transform(matrix: gltfNode.matrix)
-            // }
+            if gltfNode.skin == nil {
+                entity.transform = Transform(matrix: gltfNode.matrix)
+            }
 
             nodesForIdentifier.updateValue(entity, forKey: gltfNode.identifier)
         }
