@@ -1303,7 +1303,7 @@
                             node.name = name
                         }
 
-                        node.isJoint = true
+                        
 
                         let index = jointNames.count
                         indexByNodeID[node.identifier] = index
@@ -1321,8 +1321,16 @@
                             inverseBindMatrix = simd_inverse(absoluteTransform(for: node))
                         }
                         inverseBindMatrices.append(inverseBindMatrix)
-                        restPoseTransforms
-                            .append(Transform(matrix: node.matrix))
+                        
+                        if node.isJoint {
+                            restPoseTransforms
+                                .append(Transform(matrix: node.matrix))
+                        } else {
+                            restPoseTransforms
+                                .append(Transform())
+                        }
+                        
+                        node.isJoint = true
                         return index
                     }
 
