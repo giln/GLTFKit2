@@ -1258,7 +1258,7 @@
                         .nextUniqueName(prefix: "Skin")
                     let joints = gltfSkin.joints
                     
-                    print("SKELETON: \(gltfSkin.skeleton?.name)")
+                   
 
                     guard !joints.isEmpty else { return nil }
 
@@ -2238,7 +2238,6 @@
                         jointAnimation.jointNames,
                         jointAnimation.jointTransformSamplers
                     ) {
-                        print(jointName)
                         var samples = [Transform]()
                         samples.reserveCapacity(sampleCount)
                         for t in sampleTimes {
@@ -2281,9 +2280,6 @@
                             skeletonID
                         ] ??
                             []
-
-                        print("RESTPOSETRANSFORM")
-                        print(restPoseTransformsBySkeletonID)
                         
                         let jointFrames = (0 ..< sampleCount)
                             .map { sampleIndex -> JointTransforms in
@@ -2498,17 +2494,12 @@
                         return []
                     }
 
-                    print(
-                        "[GLTFRealityKit] convertWeightAnimations node=\(node.name ?? "<unnamed>") weights=\(info.weightNames.count) channels=\(weightChannels.count)"
-                    )
+                    
 
                     let defaultWeights = defaultBlendShapeWeights(for: node)
 
                     var animations = [AnimationDefinition]()
                     for weightChannel in weightChannels {
-                        print(
-                            "[GLTFRealityKit]  channel sampler input=\(weightChannel.sampler.input.name ?? "<unnamed>") output=\(weightChannel.sampler.output.name ?? "<unnamed>") target=\(weightChannel.target.path)"
-                        )
                         // Each channel updates either the aggregate blend weight array or a
                         // specific weight set (for meshes with multiple materials), so we
                         // emit the appropriate SampledAnimation objects for whichever case
