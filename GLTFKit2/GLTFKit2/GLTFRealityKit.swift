@@ -1251,29 +1251,36 @@
                 }
 
                 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
-                private func buildSkeletonData(for gltfSkin: GLTFSkin)
+            private func buildSkeletonData(for gltfSkin: GLTFSkin, bindingNode: GLTFNode?)
                     -> SkeletonBuildResult?
                 {
                     let skeletonName = gltfSkin.name ?? nameGenerator
                         .nextUniqueName(prefix: "Skin")
                     let joints = gltfSkin.joints
+                    
+                    print("SKELETON: \(gltfSkin.skeleton?.name)")
 
                     guard !joints.isEmpty else { return nil }
 
                     var providedInverseBindMatricesByNode =
                         [UUID: simd_float4x4]()
-                    var meshBindTransform: simd_float4x4? = nil
+                    var meshBindTransform: simd_float4x4 = matrix_identity_float4x4
 
+                    if let bindingNode {
+                        let globalJoint = absoluteTransform(for: bindingNode)
+                        meshBindTransform = simd_inverse(bindingNode.matrix)
+                    }
+                    
                     if let accessor = gltfSkin.inverseBindMatrices,
                        let matrices = packedFloat4x4(for: accessor)
                     {
                         for (joint, matrix) in zip(joints, matrices) {
                             providedInverseBindMatricesByNode[joint.identifier] = matrix
 
-                            if meshBindTransform == nil {
-                                let globalJoint = absoluteTransform(for: joint)
-                                meshBindTransform = globalJoint * matrix
-                            }
+//                            if meshBindTransform == nil {
+//                                let globalJoint = absoluteTransform(for: joint)
+//                                meshBindTransform = globalJoint * matrix
+//                            }
                         }
                     }
 
@@ -1309,16 +1316,13 @@
                         indexByNodeID[node.identifier] = index
                         jointNames.append(name)
                         parentIndices.append(parentIndex)
-                        print(meshBindTransform)
+                        
                         let inverseBindMatrix: simd_float4x4
                         if let provided = providedInverseBindMatricesByNode[node.identifier] {
                             inverseBindMatrix = provided
-                        } else if let bind = meshBindTransform {
-                            // Bring this node into the same mesh-space as the provided IBMs
-                            inverseBindMatrix = simd_inverse(absoluteTransform(for: node)) * bind
                         } else {
-                            // Fallback for skins without any provided IBMs at all
-                            inverseBindMatrix = simd_inverse(absoluteTransform(for: node))
+                            // Bring this node into the same mesh-space as the provided IBMs
+                            inverseBindMatrix = simd_inverse(absoluteTransform(for: node)) //* meshBindTransform
                         }
                         inverseBindMatrices.append(inverseBindMatrix)
                         
@@ -1326,8 +1330,9 @@
                             restPoseTransforms
                                 .append(Transform(matrix: node.matrix))
                         } else {
+                            
                             restPoseTransforms
-                                .append(Transform())
+                                .append(Transform(matrix: meshBindTransform))
                         }
                         
                         node.isJoint = true
@@ -1404,7 +1409,7 @@
                     var rootTransforms: [String: Transform] = [:]
 
                     for skin in skins {
-                        guard let data = buildSkeletonData(for: skin) else {
+                        guard let data = buildSkeletonData(for: skin, bindingNode: nil) else {
                             continue
                         }
                         let offset = mergedJointNames.count
@@ -1489,15 +1494,15 @@
                 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
                 func convert(
                     skin gltfSkin: GLTFSkin,
-                    bindingNode _: GLTFNode,
+                    bindingNode: GLTFNode,
                     context: GLTFRealityKitResourceContext
                 ) -> MeshResource.Skeleton? {
-                    guard let data = buildSkeletonData(for: gltfSkin) else {
+                    guard let data = buildSkeletonData(for: gltfSkin, bindingNode: bindingNode) else {
                         return nil
                     }
 
-                    print(data.jointNames)
-                    print(data.inverseBindPoseMatrices)
+//                    print(data.jointNames)
+//                    print(data.inverseBindPoseMatrices)
                     guard let skeleton = MeshResource.Skeleton(
                         id: data.skeletonName,
                         jointNames: data.jointNames,
@@ -2299,6 +2304,7 @@
                                         {
                                             return restTransforms[jointIndex]
                                         }
+                                        
                                         return Transform()
                                     }
                                 return JointTransforms(transforms)
@@ -2716,9 +2722,9 @@ public extension GLTFRealityKitLoader {
                 .nextUniqueName(prefix: "Node")
 
             // Ignore skin local transform
-            if gltfNode.skin == nil {
+            //if gltfNode.skin == nil || gltfNode.parent == nil {
                 entity.transform = Transform(matrix: gltfNode.matrix)
-            }
+            //}
 
             nodesForIdentifier.updateValue(entity, forKey: gltfNode.identifier)
         }
