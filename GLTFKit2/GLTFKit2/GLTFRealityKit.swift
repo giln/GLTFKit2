@@ -837,12 +837,24 @@
 
         @available(macOS 12.0, iOS 15.0, *)
         public class GLTFRealityKitLoader {
+            public struct LoaderOptions: Sendable {
+                public var suppressSkinnedChildMeshTransforms: Bool
+
+                public init(
+                    suppressSkinnedChildMeshTransforms: Bool = false
+                ) {
+                    self.suppressSkinnedChildMeshTransforms =
+                        suppressSkinnedChildMeshTransforms
+                }
+            }
+
             #if os(macOS)
                 let colorSpace =
                     NSColorSpace(cgColorSpace: CGColorSpace(name: CGColorSpace
                             .linearSRGB)!)!
             #endif
             private let nameGenerator = UniqueNameGenerator()
+            private let loaderOptions: LoaderOptions
             public static var usdRawAnimationDefinitions: [
                 String: AnimationGroup
             ] =
@@ -858,6 +870,10 @@
                 [:]
             private var skeletonTransformsByJointName: [String: Transform] = [:]
 
+            public init(options: LoaderOptions = .init()) {
+                self.loaderOptions = options
+            }
+
             private func absoluteTransform(for node: GLTFNode)
                 -> simd_float4x4
             {
@@ -868,6 +884,15 @@
                     current = parent.parent
                 }
                 return transform
+            }
+
+            private func shouldApplyTransform(for node: GLTFNode) -> Bool {
+                guard loaderOptions.suppressSkinnedChildMeshTransforms else {
+                    return true
+                }
+                // Skinned child mesh nodes are driven by their skeleton and should
+                // not also carry their bind transform as an entity transform.
+                return node.skin == nil || node.parent == nil
             }
 
             #if compiler(>=6.0) || os(visionOS)
@@ -929,13 +954,17 @@
                 }
             #endif
 
-            public static func load(from url: URL) async throws -> RealityKit
-                .Entity
+            public static func load(
+                from url: URL,
+                options: LoaderOptions = .init()
+            ) async throws -> RealityKit.Entity
             {
                 let asset = try GLTFAsset(url: url)
                 if let scene = asset.defaultScene {
                     return await MainActor.run {
-                        return convert(scene: scene, asset: asset)
+                        return convert(scene: scene,
+                                       asset: asset,
+                                       options: options)
                     }
                 } else {
                     throw NSError(domain: GLTFErrorDomain,
@@ -946,20 +975,22 @@
                 }
             }
 
-            @MainActor public static func convert(scene: GLTFScene)
-                -> RealityKit
-                .Entity
+            @MainActor public static func convert(
+                scene: GLTFScene,
+                options: LoaderOptions = .init()
+            ) -> RealityKit.Entity
             {
-                let instance = GLTFRealityKitLoader()
+                let instance = GLTFRealityKitLoader(options: options)
                 return instance.convert(scene: scene, asset: nil)
             }
 
             @MainActor public static func convert(
                 scene: GLTFScene,
-                asset: GLTFAsset?
+                asset: GLTFAsset?,
+                options: LoaderOptions = .init()
             ) -> RealityKit.Entity {
                 GLTFRealityKitLoader.usdRawAnimationDefinitions = [:]
-                let instance = GLTFRealityKitLoader()
+                let instance = GLTFRealityKitLoader(options: options)
                 return instance.convert(scene: scene, asset: asset)
             }
 
@@ -1092,7 +1123,9 @@
                 nodeEntity.name = gltfNode.name ?? nameGenerator
                     .nextUniqueName(prefix: "Node")
 
-                nodeEntity.transform = Transform(matrix: gltfNode.matrix)
+                if shouldApplyTransform(for: gltfNode) {
+                    nodeEntity.transform = Transform(matrix: gltfNode.matrix)
+                }
 
                 var skeleton: Any?
                 #if compiler(>=6.0)
@@ -2186,7 +2219,8 @@
                         transformSampler.transform(at: time)
                     }
 
-                    if !transformFrames.isEmpty {
+                    if !transformFrames.isEmpty,
+                       shouldApplyTransform(for: targetNode) {
                         // Even when a mesh is skinned, the authoring rig often keeps
                         // attachments (eyes, teeth, accessories) as child nodes of the
                         // head. Baking node animations ensures those attachments follow
@@ -2678,8 +2712,11 @@ extension GLTFRealityKitLoader {
 @available(macOS 15.0, iOS 18.0, visionOS 2.0, *)
 @MainActor
 public extension GLTFRealityKitLoader {
-    static func convertRootAsset(asset: GLTFAsset) throws -> Entity {
-        let instance = GLTFRealityKitLoader()
+    static func convertRootAsset(
+        asset: GLTFAsset,
+        options: LoaderOptions = .init()
+    ) throws -> Entity {
+        let instance = GLTFRealityKitLoader(options: options)
         let rootEntity = Entity()
         rootEntity.name = "GLTF_Scene_Root"
 
@@ -2712,10 +2749,9 @@ public extension GLTFRealityKitLoader {
             entity.name = gltfNode.name ?? instance.nameGenerator
                 .nextUniqueName(prefix: "Node")
 
-            // Ignore skin local transform
-            //if gltfNode.skin == nil || gltfNode.parent == nil {
+            if instance.shouldApplyTransform(for: gltfNode) {
                 entity.transform = Transform(matrix: gltfNode.matrix)
-            //}
+            }
 
             nodesForIdentifier.updateValue(entity, forKey: gltfNode.identifier)
         }
