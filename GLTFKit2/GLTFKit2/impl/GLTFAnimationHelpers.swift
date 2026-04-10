@@ -12,6 +12,51 @@ func lerp(_ a: simd_quatf, _ b: simd_quatf, _ t: Float) -> simd_quatf {
     return simd_quatf(vector: a.vector + t * (b.vector - a.vector))
 }
 
+func canonicalizeQuaternionSigns(
+    _ values: [simd_quatf],
+    interpolation: GLTFInterpolationMode,
+    reference: simd_quatf
+) -> [simd_quatf] {
+    guard !values.isEmpty else { return values }
+
+    func aligned(_ value: simd_quatf, to reference: simd_quatf) -> simd_quatf {
+        if simd_dot(value.vector, reference.vector) < 0 {
+            return simd_quatf(vector: -value.vector)
+        }
+        return value
+    }
+
+    if interpolation == .cubic {
+        var corrected = values
+        var previous = reference
+        var index = 0
+        while index + 2 < corrected.count {
+            let value = corrected[index + 1]
+            let alignedValue = aligned(value, to: previous)
+            if simd_dot(alignedValue.vector, value.vector) < 0 {
+                corrected[index] = simd_quatf(vector: -corrected[index].vector)
+                corrected[index + 1] = alignedValue
+                corrected[index + 2] = simd_quatf(vector: -corrected[index + 2].vector)
+            } else {
+                corrected[index + 1] = alignedValue
+            }
+            previous = corrected[index + 1]
+            index += 3
+        }
+        return corrected
+    }
+
+    var corrected: [simd_quatf] = []
+    corrected.reserveCapacity(values.count)
+    var previous = reference
+    for value in values {
+        let alignedValue = aligned(value, to: previous)
+        corrected.append(alignedValue)
+        previous = alignedValue
+    }
+    return corrected
+}
+
 func unlerp(_ a: Float, _ b: Float, _ t: Float) -> Float {
     if a == b { return 0 } // No solution; avoid division by zero
     return (t - a) / (b - a)
@@ -200,6 +245,11 @@ class GLTFTransformSampler {
             rotationTimes = times
             rotationValues = values
             rotationInterp = sampler.interpolationMode
+            rotationValues = canonicalizeQuaternionSigns(
+                rotationValues,
+                interpolation: rotationInterp,
+                reference: target.rotation
+            )
         }
         var scaleTimes = [minTime]; var scaleValues = [target.scale]
         var scaleInterp = GLTFInterpolationMode.linear

@@ -835,6 +835,21 @@
             }
         }
 
+        @available(iOS 13.0, *)
+        fileprivate func transformApproximatelyEqual(
+            _ lhs: Transform,
+            _ rhs: Transform,
+            tolerance: Float = 1e-4
+        ) -> Bool {
+            let translationDelta = simd_abs(lhs.translation - rhs.translation)
+            let scaleDelta = simd_abs(lhs.scale - rhs.scale)
+            let rotationDot = abs(simd_dot(lhs.rotation.vector, rhs.rotation.vector))
+
+            return translationDelta.max() <= tolerance &&
+                scaleDelta.max() <= tolerance &&
+                rotationDot >= (1 - tolerance)
+        }
+
         @available(macOS 12.0, iOS 15.0, *)
         public class GLTFRealityKitLoader {
             public struct LoaderOptions: Sendable {
@@ -892,7 +907,28 @@
                 }
                 // Skinned child mesh nodes are driven by their skeleton and should
                 // not also carry their bind transform as an entity transform.
-                return node.skin == nil || node.parent == nil
+                if node.skin != nil, node.parent != nil {
+                    return false
+                }
+
+                if isDirectSkinnedMeshWrapper(node) {
+                    return false
+                }
+
+                return true
+            }
+
+            private func isDirectSkinnedMeshWrapper(_ node: GLTFNode) -> Bool {
+                guard node.skin == nil,
+                      node.mesh == nil,
+                      !node.isJoint,
+                      node.childNodes.count == 1,
+                      let child = node.childNodes.first
+                else {
+                    return false
+                }
+
+                return child.skin != nil && child.mesh != nil
             }
 
             #if compiler(>=6.0) || os(visionOS)
@@ -2219,8 +2255,20 @@
                         transformSampler.transform(at: time)
                     }
 
+                    let restTransform = Transform(
+                        scale: targetNode.scale,
+                        rotation: targetNode.rotation,
+                        translation: targetNode.translation
+                    )
+
+                    let hasMeaningfulTransformSamples = transformFrames
+                        .contains { frame in
+                            !transformApproximatelyEqual(frame, restTransform)
+                        }
+
                     if !transformFrames.isEmpty,
-                       shouldApplyTransform(for: targetNode) {
+                       shouldApplyTransform(for: targetNode),
+                       hasMeaningfulTransformSamples {
                         // Even when a mesh is skinned, the authoring rig often keeps
                         // attachments (eyes, teeth, accessories) as child nodes of the
                         // head. Baking node animations ensures those attachments follow
